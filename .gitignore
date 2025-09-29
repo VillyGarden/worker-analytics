@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env secrets
+.env
+.env.*
+*.env
+
+# OS/editor junk
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and temp
+logs/
+*.log
+tmp/
+cache/
+
+# Data dumps
+data/
+*.db
+
+# Node (на будущее)
+node_modules/
