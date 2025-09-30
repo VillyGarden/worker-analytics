@@ -256,7 +256,7 @@ def dashboard(request: Request):
 <meta charset="utf-8"/>
 <title>Worker Analytics — Дашборд</title>
 <script src="/static/plotly.min.js"></script>
-<script src="/static/dashboard.js"></script>
+<script src="/static/dashboard.js?v=2"></script>
 <style>
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans","Liberation Sans";margin:24px;background:#0b0c10;color:#e6e6e6}
  h1{font-size:22px;margin:0 0 12px}
@@ -309,6 +309,15 @@ def dashboard(request: Request):
     <div id="compare-table"></div>
   </div>
 
+  
+  <div class="card col-12">
+    <div class="muted">Сравнительный график выручки (текущий период vs выбранные сравнения)</div>
+    <div id="chart-compare" style="height:360px"></div>
+    <div style="margin-top:8px" class="muted">
+      <label><input type="checkbox" id="cmp-prev-period" checked> с предыдущим периодом</label>
+      <label style="margin-left:12px"><input type="checkbox" id="cmp-prev-year"> с прошлым годом</label>
+    </div>
+  </div>
   <div class="grid">
     <div class="card col-3">
       <div class="kpi" id="kpi-rev">—</div>
