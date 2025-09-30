@@ -1,41 +1,40 @@
 function fmt(x){return x.toLocaleString('ru-RU',{minimumFractionDigits:2, maximumFractionDigits:2});}
 function pct(a,b){if(!b) return 0; return (a/b*100-100);}
 function cls(n){return n>=0?'good':'bad';}
+const toISO = (d)=> d.toISOString().slice(0,10);
+const parseISO = (s)=>{const [y,m,dd]=s.split('-').map(Number); return new Date(y, m-1, dd);};
 
 function setPeriodCurrentMonth(){
   const now = new Date();
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
   const end = now;
-  const f = (d)=> d.toISOString().slice(0,10);
-  document.getElementById('start').value = f(start);
-  document.getElementById('end').value = f(end);
+  document.getElementById('start').value = toISO(start);
+  document.getElementById('end').value = toISO(end);
 }
 function setPeriodPrevMonth(){
   const now = new Date();
   const first = new Date(now.getFullYear(), now.getMonth(), 1);
   const prevLast = new Date(first-1);
   const prevFirst = new Date(prevLast.getFullYear(), prevLast.getMonth(), 1);
-  const f = (d)=> d.toISOString().slice(0,10);
-  document.getElementById('start').value = f(prevFirst);
-  document.getElementById('end').value = f(prevLast);
+  document.getElementById('start').value = toISO(prevFirst);
+  document.getElementById('end').value = toISO(prevLast);
 }
 function setPeriodYTD(){
   const now = new Date();
   const start = new Date(now.getFullYear(), 0, 1);
   const end = now;
-  const f = (d)=> d.toISOString().slice(0,10);
-  document.getElementById('start').value = f(start);
-  document.getElementById('end').value = f(end);
+  document.getElementById('start').value = toISO(start);
+  document.getElementById('end').value = toISO(end);
 }
 function setPeriodPrevYear(){
   const now = new Date();
   const start = new Date(now.getFullYear()-1, 0, 1);
   const end = new Date(now.getFullYear()-1, 11, 31);
-  const f = (d)=> d.toISOString().slice(0,10);
-  document.getElementById('start').value = f(start);
-  document.getElementById('end').value = f(end);
+  document.getElementById('start').value = toISO(start);
+  document.getElementById('end').value = toISO(end);
 }
 
+// ---------- Графики последних 60 дней ----------
 async function loadChartsAndKPI(){
   const [rev, mar, inf] = await Promise.all([
     fetch('/api/revenue/daily?days=60',{credentials:'include'}).then(r=>r.json()),
@@ -45,7 +44,7 @@ async function loadChartsAndKPI(){
   const revRows = rev.data||[], marRows = mar.data||[], infRows = inf.data||[];
 
   // KPI за 7 дней
-  const from7 = (()=>{const d=new Date(); d.setDate(d.getDate()-6); return d.toISOString().slice(0,10);})();
+  const from7 = (()=>{const d=new Date(); d.setDate(d.getDate()-6); return toISO(d);})();
   const kRows = marRows.filter(r=>r.date>=from7);
   const kRev = kRows.reduce((s,r)=>s+(r.revenue||0),0);
   const kGP  = kRows.reduce((s,r)=>s+(r.gross_profit||0),0);
@@ -108,6 +107,94 @@ async function loadChartsAndKPI(){
   );
 }
 
+// ---------- API utils ----------
+async function fetchSummarySeries(start, end, wh){
+  const url = new URL('/api/summary', location.origin);
+  url.searchParams.set('start', start);
+  url.searchParams.set('end', end);
+  url.searchParams.set('group', 'day');
+  if(wh) url.searchParams.set('warehouse_id', wh);
+  const res = await fetch(url, {credentials:'include'});
+  if(!res.ok) throw new Error('summary failed');
+  const data = await res.json();
+  const series = data.series || [];
+  // ожидаем объекты вида {period:'YYYY-MM-DD', revenue:..., cost:..., receipts:...}
+  return series.map(r=>({date: r.period, revenue: r.revenue || 0}));
+}
+
+function rangeDays(startISO, endISO){
+  const s = parseISO(startISO), e = parseISO(endISO);
+  const days = [];
+  let d = new Date(s);
+  while(d <= e){ days.push(toISO(d)); d.setDate(d.getDate()+1); }
+  return days;
+}
+
+function shiftOneDay(iso, delta){
+  const d = parseISO(iso); d.setDate(d.getDate()+delta); return toISO(d);
+}
+
+function prevPeriodRange(startISO, endISO){
+  // предыдущий период такой же длины, заканчивается за день до текущего старта
+  const len = rangeDays(startISO, endISO).length;
+  const prevEnd = shiftOneDay(startISO, -1);
+  const prevStart = shiftOneDay(prevEnd, -(len-1));
+  return {start: prevStart, end: prevEnd};
+}
+
+function prevYearRange(startISO, endISO){
+  const s = parseISO(startISO), e = parseISO(endISO);
+  const s2 = new Date(s.getFullYear()-1, s.getMonth(), s.getDate());
+  const e2 = new Date(e.getFullYear()-1, e.getMonth(), e.getDate());
+  return {start: toISO(s2), end: toISO(e2)};
+}
+
+// ---------- Сравнительный график ----------
+async function loadCompareChart(){
+  const start = document.getElementById('start').value;
+  const end   = document.getElementById('end').value;
+  const wh    = document.getElementById('warehouse').value;
+  const doPrev = document.getElementById('cmp-prev-period').checked;
+  const doYoY  = document.getElementById('cmp-prev-year').checked;
+
+  const days = rangeDays(start, end);
+  const nowSeries = await fetchSummarySeries(start, end, wh);
+  const nowMap = Object.fromEntries(nowSeries.map(r=>[r.date, r.revenue]));
+  const x = days.map((_,i)=> i+1); // индекс дня
+  const nowY = days.map(d=> nowMap[d] ?? 0);
+
+  const traces = [{
+    x, y: nowY, type:'scatter', mode:'lines+markers', name:'Текущий период'
+  }];
+
+  if(doPrev){
+    const pp = prevPeriodRange(start, end);
+    const prevSeries = await fetchSummarySeries(pp.start, pp.end, wh);
+    const prevMap = Object.fromEntries(prevSeries.map(r=>[r.date, r.revenue]));
+    const prevDays = rangeDays(pp.start, pp.end);
+    const prevY = prevDays.map(d=> prevMap[d] ?? 0);
+    traces.push({x, y: prevY, type:'scatter', mode:'lines', name:'Пред. период', line:{dash:'dot'}});
+  }
+
+  if(doYoY){
+    const yy = prevYearRange(start, end);
+    const yoySeries = await fetchSummarySeries(yy.start, yy.end, wh);
+    const yoyMap = Object.fromEntries(yoySeries.map(r=>[r.date, r.revenue]));
+    const yoyDays = rangeDays(yy.start, yy.end);
+    const yoyY = yoyDays.map(d=> yoyMap[d] ?? 0);
+    traces.push({x, y: yoyY, type:'scatter', mode:'lines', name:'Год назад', line:{dash:'dash'}});
+  }
+
+  Plotly.newPlot('chart-compare', traces, {
+    paper_bgcolor:'#0b0c10', plot_bgcolor:'#0b0c10',
+    xaxis:{gridcolor:'#222831', title:'День периода', dtick:1, rangemode:'tozero'},
+    yaxis:{gridcolor:'#222831', title:'Выручка ₽'},
+    margin:{t:10,r:10,b:40,l:60},
+    legend:{orientation:'h'}
+  }, {displayModeBar:false, responsive:true});
+}
+
+// ---------- Топы и сравнение таблицей ----------
 async function loadWarehouses(){
   const res = await fetch('/api/warehouses',{credentials:'include'});
   const json = await res.json();
@@ -163,8 +250,8 @@ async function loadComparison(){
     const curFmt = name==='Маржа %' ? curv.toFixed(1)+' %' : (name==='Количество чеков'? (curv||0).toFixed(0) : fmt(curv) + (name==='Средний чек'?' ₽':' ₽'));
     const pFmt   = name==='Маржа %' ? (pv||0).toFixed(1)+' %' : (name==='Количество чеков'? (pv||0).toFixed(0) : fmt(pv||0) + (name==='Средний чек'?' ₽':' ₽'));
     const yFmt   = name==='Маржа %' ? (yv||0).toFixed(1)+' %' : (name==='Количество чеков'? (yv||0).toFixed(0) : fmt(yv||0) + (name==='Средний чек'?' ₽':' ₽'));
-    const d1Fmt  = name==='Маржа %' ? (d1||0).toFixed(1)+' п.п.' : (name==='Количество чеков'? (isFinite(d1)? d1.toFixed(1)+' %':'—') : (isFinite(d1)? d1.toFixed(1)+' %':'—'));
-    const d2Fmt  = name==='Маржа %' ? (d2||0).toFixed(1)+' п.п.' : (name==='Количество чеков'? (isFinite(d2)? d2.toFixed(1)+' %':'—') : (isFinite(d2)? d2.toFixed(1)+' %':'—'));
+    const d1Fmt  = name==='Маржа %' ? (d1||0).toFixed(1)+' п.п.' : (isFinite(d1)? d1.toFixed(1)+' %':'—');
+    const d2Fmt  = name==='Маржа %' ? (d2||0).toFixed(1)+' п.п.' : (isFinite(d2)? d2.toFixed(1)+' %':'—');
     html += `<tr><td>${name}</td><td>${curFmt}</td><td>${pFmt}</td><td class="${d1c}">${d1Fmt}</td><td>${yFmt}</td><td class="${d2c}">${d2Fmt}</td></tr>`;
   }
   html += '</tbody></table>';
@@ -172,6 +259,9 @@ async function loadComparison(){
 
   await Promise.all([loadTopWarehouses(start, end), loadTopProducts(start, end, wh)]);
   document.getElementById('tp-scope').textContent = wh ? ('склад ID '+wh) : 'по всем складам';
+
+  // и перерисуем сравнительный график
+  await loadCompareChart();
 }
 
 async function loadTopWarehouses(start, end){
@@ -224,6 +314,8 @@ function wireQuickButtons(){
   document.getElementById('btn-prev-month').addEventListener('click', ()=>{ setPeriodPrevMonth(); loadComparison(); });
   document.getElementById('btn-ytd').addEventListener('click', ()=>{ setPeriodYTD(); loadComparison(); });
   document.getElementById('btn-prev-year').addEventListener('click', ()=>{ setPeriodPrevYear(); loadComparison(); });
+  document.getElementById('cmp-prev-period').addEventListener('change', loadCompareChart);
+  document.getElementById('cmp-prev-year').addEventListener('change', loadCompareChart);
 }
 
 async function boot(){
