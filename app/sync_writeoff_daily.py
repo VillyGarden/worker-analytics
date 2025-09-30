@@ -2,20 +2,28 @@ import os, asyncio, datetime as dt
 from decimal import Decimal
 from typing import Dict, Tuple
 import httpx
+import random
+import time, random
+import asyncio, time, random
+_HTTP_SEMAPHORE = asyncio.Semaphore(1)
+_LAST_HTTP_CALL = 0.0
+_BASE_DELAY = float(os.getenv("MS_BASE_DELAY", "0.35"))  # сек между запросами
 
 from .db import SessionLocal
 from .models import Warehouse, SalesDaily
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+_ASSORTMENT_BP_CACHE: dict[str, int] = {}
 
-# -------- токен: читаем MS_API_TOKEN из .env/окружения --------
+# -------- С‚РѕРєРµРЅ: С‡РёС‚Р°РµРј MS_API_TOKEN РёР· .env/РѕРєСЂСѓР¶РµРЅРёСЏ --------
 def _read_token() -> str | None:
     tok = os.getenv("MS_API_TOKEN")
     if tok:
         return tok.strip().strip('"')
-    # пробуем прочитать из .env файла проекта
+    # РїСЂРѕР±СѓРµРј РїСЂРѕС‡РёС‚Р°С‚СЊ РёР· .env С„Р°Р№Р»Р° РїСЂРѕРµРєС‚Р°
     try:
         from pathlib import Path
         for line in (Path(__file__).resolve().parent.parent / ".env").read_text().splitlines():
@@ -30,7 +38,7 @@ def _read_token() -> str | None:
 
 TOKEN = _read_token()
 if not TOKEN:
-    raise RuntimeError("MS_API_TOKEN пуст. Добавь в .env строку MS_API_TOKEN=\"...\"")
+    raise RuntimeError("MS_API_TOKEN РїСѓСЃС‚. Р”РѕР±Р°РІСЊ РІ .env СЃС‚СЂРѕРєСѓ MS_API_TOKEN=\"...\"")
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
@@ -38,16 +46,16 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# точное имя кастомного поля
+# С‚РѕС‡РЅРѕРµ РёРјСЏ РєР°СЃС‚РѕРјРЅРѕРіРѕ РїРѕР»СЏ
 REASON_FIELD_NAME = "ПРИЧИНА СПИСАНИЯ"
 
 def bucket_for_reason(value: str) -> str:
     if not value:
         return "other"
     v = value.strip().lower()
-    if "брак" in v:
+    if "Р±СЂР°Рє" in v:
         return "defect"
-    if "инвентар" in v:
+    if "РёРЅРІРµРЅС‚Р°СЂ" in v:
         return "inventory"
     return "other"
 
@@ -73,51 +81,237 @@ async def fetch_loss_docs(ac: httpx.AsyncClient, store_href: str, day: dt.date) 
     return docs
 
 async def fetch_positions_sum(ac: httpx.AsyncClient, doc_href: str) -> Decimal:
-    total = Decimal("0")
+    """Возвращает сумму себестоимости документа списания.
+       Приоритет: positions.sum (копейки) > positions.price*quantity (копейки) > buyPrice.value*qty.
+    """
+    import asyncio, random
+    base_href = doc_href.split("?", 1)[0]
+
+    async def _get_with_retry(url: str, params=None, base_delay: float = 0.8, max_retries: int = 5):
+        tries = 0
+        while True:
+            r = await ac.get(url, params=params)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                ra = r.headers.get("Retry-After")
+                try:
+                    delay = float(ra) if ra is not None else None
+                except Exception:
+                    delay = None
+                if delay is None:
+                    delay = min(2 ** tries, 30) + random.uniform(0.0, 0.3)
+                tries += 1
+                if tries > max_retries:
+                    r.raise_for_status()
+                await asyncio.sleep(delay)
+                continue
+            r.raise_for_status()
+            await asyncio.sleep(base_delay + random.uniform(0.0, 0.2))
+            return r
+
+    def _to_int_qty(q):
+        try:
+            return int(q) if isinstance(q, int) else int(float(q))
+        except Exception:
+            return 0
+
+    def _to_cents_from_money(val):
+        # buyPrice.value: если int — копейки; если float/str — рубли, умножаем на 100
+        if val is None:
+            return 0
+        if isinstance(val, int):
+            return val
+        try:
+            s = str(val).strip().replace(",", ".")
+            return int(round(float(s) * 100))
+        except Exception:
+            return 0
+
+    total_cents = 0
     offset = 0
     while True:
-        r = await ac.get(f"{doc_href}/positions", params={"limit": 1000, "offset": offset})
-        if r.status_code == 429:
-            # �������� ������������ ������� ��������, ��� � ���������
-            await asyncio.sleep(2)
-            continue
-        r.raise_for_status()
+        r = await _get_with_retry(f"{base_href}/positions", params={"limit": 1000, "offset": offset})
         data = r.json()
-        rows = data.get("rows", [])
+        rows = data.get("rows", []) or []
+
+        # 1) Пытаемся сложить готовые суммы строк
+        sum_cents = 0
+        has_any_sum = False
         for p in rows:
-            s = p.get("sum", 0) or 0
-            total += Decimal(s) / Decimal(100)
+            s = p.get("sum")
+            if isinstance(s, int) and s > 0:
+                sum_cents += s
+                has_any_sum = True
+        if has_any_sum:
+
+            total_cents += sum_cents
+        else:
+            # 2) Пробуем price*qty. В API price — копейки за единицу.
+            price_cents = 0
+            used_any_price = False
+            for p in rows:
+                qty = _to_int_qty(p.get("quantity") or 0)
+                price = p.get("price")
+                if qty and isinstance(price, (int, float)):
+                    pc = int(price) if isinstance(price, int) else int(round(float(price)))
+                    price_cents += pc * qty
+                    used_any_price = True
+            if used_any_price:
+
+                total_cents += price_cents
+            else:
+                # 3) Fallback: buyPrice.value * qty
+                bp_total = 0
+                try:
+                    cache = _ASSORTMENT_BP_CACHE
+                except NameError:
+                    cache = _ASSORTMENT_BP_CACHE = {}
+                for p in rows:
+                    qty = _to_int_qty(p.get("quantity") or 0)
+                    ass = p.get("assortment") or {}
+                    href = ((ass.get("meta") or {}).get("href"))
+                    bp_cents = 0
+                    if href:
+                        cached = cache.get(href)
+                        if cached is None:
+                            ar = await _get_with_retry(href)
+                            ad = ar.json()
+                            bp = ad.get("buyPrice")
+                            val = bp.get("value") if isinstance(bp, dict) else None
+                            bp_cents = _to_cents_from_money(val)
+                            cache[href] = bp_cents
+                        else:
+                            bp_cents = cached
+                    bp_total += bp_cents * qty
+
+                total_cents += bp_total
+
         if len(rows) < 1000:
             break
         offset += 1000
-        await asyncio.sleep(0.5)  # ���� ��������� �����, ����� �� ������ 429
-    return total
 
-async def collect_writeoff_for_day(ac: httpx.AsyncClient, wh_ms_id: str, day: dt.date) -> Tuple[Decimal, Dict[str, Decimal]]:
+    result = Decimal(total_cents) / Decimal(100)
+
+    return result
+
+    async def _get_with_retry(url: str, params=None, base_delay: float = 1.0, max_retries: int = 6):
+        tries = 0
+        while True:
+            r = await ac.get(url, params=params)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        delay = float(ra)
+                    except Exception:
+                        delay = min(2 ** tries, 30) + random.uniform(0.0, 0.3)
+                else:
+                    delay = min(2 ** tries, 30) + random.uniform(0.0, 0.3)
+                tries += 1
+                if tries > max_retries:
+                    r.raise_for_status()
+                await asyncio.sleep(delay)
+                continue
+            r.raise_for_status()
+            await asyncio.sleep(base_delay + random.uniform(0.0, 0.2))
+            return r
+
+    total_cents = 0
+    offset = 0
+    while True:
+        r = await _get_with_retry(f"{base_href}/positions", params={"limit": 1000, "offset": offset})
+        data = r.json()
+        rows = data.get("rows", []) or []
+
+        for p in rows:
+            qty = p.get("quantity") or 0
+            ass = p.get("assortment") or {}
+            href = ((ass.get("meta") or {}).get("href"))
+            bp_cents = 0
+            if href:
+                # кэш на уровне модуля
+                try:
+                    cache = _ASSORTMENT_BP_CACHE
+                except NameError:
+                    cache = _ASSORTMENT_BP_CACHE = {}
+                cached = cache.get(href)
+                if cached is None:
+                    ar = await _get_with_retry(href)
+                    ad = ar.json()
+                    bp = ad.get("buyPrice")
+                    val = bp.get("value") if isinstance(bp, dict) else None
+                    if val is None:
+                        bp_cents = 0
+                    elif isinstance(val, int):
+                        bp_cents = val
+                    elif isinstance(val, float):
+                        bp_cents = int(val) if float(val).is_integer() else int(round(val * 100))
+                    else:
+                        s = str(val).strip().replace(",", ".")
+                        if s:
+                            if "." in s:
+                                try:
+                                    bp_cents = int(round(float(s) * 100))
+                                except:
+                                    bp_cents = 0
+                            else:
+                                try:
+                                    bp_cents = int(s)
+                                except:
+                                    bp_cents = 0
+                        else:
+                            bp_cents = 0
+                    cache[href] = bp_cents
+                else:
+                    bp_cents = cached
+            try:
+                q = int(qty) if isinstance(qty, int) else int(float(qty))
+            except Exception:
+                q = 0
+            total_cents += bp_cents * q
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    return Decimal(total_cents) / Decimal(100)
+
+async def collect_writeoff_for_day(ac: httpx.AsyncClient, wh_ms_id: str, day: dt.date) -> tuple[Decimal, dict]:
     store_href = f"{MS_BASE}/entity/store/{wh_ms_id}"
     docs = await fetch_loss_docs(ac, store_href, day)
     buckets = {"defect": Decimal("0"), "inventory": Decimal("0"), "other": Decimal("0")}
     total = Decimal("0")
+
     for d in docs:
-        # причина списания из атрибутов
-        reason_val = None
-        for a in d.get("attributes") or []:
-            if a.get("name") == REASON_FIELD_NAME:
-                val = a.get("value")
-                if isinstance(val, dict):
-                    reason_val = val.get("name") or ""
-                else:
-                    reason_val = str(val or "")
+        # НОРМАЛЬНО извлекаем причину
+        reason_val = ""
+        attrs = d.get("attributes") or []
+        for a in attrs:
+            nm = str(a.get("name") or "").strip().lower()
+            val = a.get("value")
+            val_name = ""
+            if isinstance(val, dict):
+                val_name = str(val.get("name") or "")
+            else:
+                val_name = str(val or "")
+            # сначала по имени поля
+            if "причин" in nm and "списан" in nm:
+                reason_val = val_name
                 break
-        bucket = bucket_for_reason(reason_val or "")
-        # считаем себестоимость по позициям
+            # fallback: по содержимому значения
+            vlow = val_name.strip().lower()
+            if "брак" in vlow or "инвентар" in vlow:
+                reason_val = val_name
+                break
+
+        bucket = bucket_for_reason(reason_val)
         doc_href = d["meta"]["href"]
-        cost = await fetch_positions_sum(ac, doc_href)
-        total += cost
-        buckets[bucket] += cost
+        v = await fetch_positions_sum(ac, doc_href)
+
+        total += v
+        buckets[bucket] += v
+
     return total, buckets
 
 def upsert_writeoff(db: Session, wh_id: int, day: dt.date, total, buckets):
+
     stmt = insert(SalesDaily).values(
         date=day, warehouse_id=wh_id,
         writeoff_cost_total=total,
@@ -136,6 +330,19 @@ def upsert_writeoff(db: Session, wh_id: int, day: dt.date, total, buckets):
     )
     db.execute(stmt)
 
+
+def _ensure_reason_table(db: Session):
+    # создаём, если не существует
+    db.execute(text("""
+    CREATE TABLE IF NOT EXISTS writeoff_daily_reason (
+        date date NOT NULL,
+        warehouse_id integer NOT NULL,
+        reason text NOT NULL,
+        cost numeric(18,2) NOT NULL DEFAULT 0,
+        PRIMARY KEY (date, warehouse_id, reason)
+    );
+    """))
+
 async def run_days(days_back: int = 30):
     async with httpx.AsyncClient(http2=True, headers=HEADERS, timeout=60.0) as ac:
         with SessionLocal() as db:
@@ -151,16 +358,107 @@ async def run_days(days_back: int = 30):
                 print(f"[{wh.name}] {start}..{today} writeoff synced")
     print("done")
 
-async def run_range(start, end):
-    import asyncio
-    days = []
-    d = start
-    while d <= end:
-        days.append(d)
-        d += datetime.timedelta(days=1)
-    await run_days(days)
 
+async def run_range(start: dt.date, end: dt.date):
+    async with httpx.AsyncClient(http2=True, headers=HEADERS, timeout=60.0) as ac:
+        with SessionLocal() as db:
+            _ensure_reason_table(db)
+            whs = db.query(Warehouse).order_by(Warehouse.id).all()
+            d = start
+            while d <= end:
+                for wh in whs:
+                    store_href = f"{MS_BASE}/entity/store/{wh.ms_id}"
+                    docs = await fetch_loss_docs(ac, store_href, d)
+                    day_total = Decimal("0")
+                    buckets = {"defect": Decimal("0"), "inventory": Decimal("0"), "other": Decimal("0")}
+                    reason_totals = {}  # raw reason -> Decimal
+                    for doc in docs:
+                        href = doc["meta"]["href"]
+                        sub = await fetch_positions_sum(ac, href)
 
+                        # вытаскиваем причину максимально терпимо
+                        reason_val = ""
+                        attrs = doc.get("attributes") or []
+                        for a in attrs:
+                            nm = str(a.get("name") or "").strip().lower()
+                            val = a.get("value")
+                            val_name = (val.get("name") if isinstance(val, dict) else str(val or "")).strip()
+                            if "причин" in nm and "списан" in nm:
+                                reason_val = val_name
+                                break
+                            vlow_try = val_name.lower()
+                            if "брак" in vlow_try or "инвент" in vlow_try:  # ловим и «Интвентаризация»
+                                reason_val = val_name
+                                break
+
+                        # ключ для записи в таблицу причин
+                        reason_key = reason_val or "—"
+                        reason_totals[reason_key] = reason_totals.get(reason_key, Decimal("0")) + sub
+
+                        # колонки в sales_daily заполняем грубо по ключевым словам
+                        vlow = (reason_val or "").lower()
+                        if "брак" in vlow:
+                            bucket = "defect"
+                        elif ("инвент" in vlow) or ("инвентар" in vlow) or ("интвент" in vlow) or ("интвентар" in vlow):
+                            bucket = "inventory"
+                        else:
+                            bucket = "other"
+
+                        buckets[bucket] += sub
+                        day_total += sub
+
+                    # пишем totals в sales_daily
+                    upsert_writeoff(db, wh.id, d, day_total, buckets)
+
+                    # пишем разрез по причинам
+                    for rname, rcost in reason_totals.items():
+                        db.execute(text("""
+                            INSERT INTO writeoff_daily_reason(date, warehouse_id, reason, cost)
+                            VALUES (:date, :wh, :reason, :cost)
+                            ON CONFLICT (date, warehouse_id, reason)
+                            DO UPDATE SET cost = EXCLUDED.cost
+                        """), {"date": d, "wh": wh.id, "reason": rname, "cost": rcost})
+
+                db.commit()
+                d += dt.timedelta(days=1)
+    print(f"done range {start}..{end}")
 if __name__ == "__main__":
-    days = int(os.getenv("DAYS_BACK", "30"))
-    asyncio.run(run_days(days))
+    start_s = os.getenv("START")
+    end_s = os.getenv("END")
+    if start_s:
+        # режим точного диапазона
+        start = dt.date.fromisoformat(start_s)
+        end = dt.date.fromisoformat(end_s) if end_s else start
+        asyncio.run(run_range(start, end))
+    else:
+        days = int(os.getenv("DAYS_BACK", "30"))
+        asyncio.run(run_days(days))
+
+async def _throttle_get(ac: httpx.AsyncClient, url: str, *, params=None, base_delay: float = None, max_retries: int = 6):
+    """GET с паузой между вызовами и повтором по 429/5xx с учётом Retry-After."""
+    if base_delay is None:
+        try:
+            base_delay = float(os.getenv("MS_BASE_DELAY", "0.6"))
+        except Exception:
+            base_delay = 0.6
+    tries = 0
+    while True:
+        r = await ac.get(url, params=params)
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            ra = r.headers.get("Retry-After")
+            if ra:
+                try:
+                    delay = float(ra)
+                except Exception:
+                    delay = min(2 ** tries, 30) + random.uniform(0.0, 0.3)
+            else:
+                delay = min(2 ** tries, 30) + random.uniform(0.0, 0.3)
+            tries += 1
+            if tries > max_retries:
+                r.raise_for_status()
+            await asyncio.sleep(delay)
+            continue
+        r.raise_for_status()
+        # небольшая межзапросная пауза, чтобы не долбить API
+        await asyncio.sleep(base_delay + random.uniform(0.0, 0.15))
+        return r
