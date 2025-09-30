@@ -31,3 +31,9 @@ class SalesDaily(Base):
     inflow_cost: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False, default=0)      # оприходования по себестоимости
 
     warehouse: Mapped["Warehouse"] = relationship("Warehouse", back_populates="sales_daily")
+
+    # списания (себестоимость)
+    writeoff_cost_total: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    writeoff_cost_defect: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    writeoff_cost_inventory: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    writeoff_cost_other: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False, default=0)
