@@ -28,25 +28,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-WHITELIST = {"/login", "/health", "/static"}
+WHITELIST_EXACT = {"/login", "/health"}
+WHITELIST_PREFIXES = ("/static", "/favicon.ico")
 
 class AuthRequiredMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        path = request.url.path.rstrip("/") or "/"
-        sess_present = "session" in request.scope
-        user = None
-        err = None
-        if sess_present:
-            try:
-                user = request.session.get("user")
-            except Exception as e:
-                err = str(e)
-        # Мини-лог в stdout (journalctl увидит)
-        print("AUTHDBG", {"path": path, "cookie": request.headers.get("cookie"), "sess_present": sess_present, "user": user, "err": err})
+        path = (request.url.path or "/").rstrip("/") or "/"
+        try:
+            user = request.session.get("user")
+        except Exception as e:
+            user = None
+            print("AUTHDBG_ERR", {"err": str(e)})
+
+        # компактный лог
+        print("AUTHDBG", {"path": path, "user": user})
+
+        WHITELIST_EXACT = {"/login", "/health"}
+        WHITELIST_PREFIXES = ("/static", "/favicon.ico", "/openapi.json", "/docs", "/redoc")
+
         if path == "/login" and user:
             return RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-        if not user and path not in WHITELIST:
+
+        if (not user) and not (path in WHITELIST_EXACT or any(path.startswith(pfx) for pfx in WHITELIST_PREFIXES)):
             return RedirectResponse(url="/login", status_code=status.HTTP_302_FOUND)
+
         return await call_next(request)
 
 # ВАЖНО: сначала SessionMiddleware, затем наш guard
@@ -256,7 +261,7 @@ def dashboard(request: Request):
 <meta charset="utf-8"/>
 <title>Worker Analytics — Дашборд</title>
 <script src="/static/plotly.min.js"></script>
-<script src="/static/dashboard.js?v=2"></script>
+<script src="/static/dashboard.js?v=9"></script>
 <style>
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans","Liberation Sans";margin:24px;background:#0b0c10;color:#e6e6e6}
  h1{font-size:22px;margin:0 0 12px}
@@ -368,3 +373,100 @@ def not_found_handler(request: Request, exc: StarletteHTTPException):
             return RedirectResponse(url="/dashboard", status_code=302)
         return RedirectResponse(url="/login", status_code=302)
     return HTMLResponse(str(exc.detail), status_code=exc.status_code)
+
+# ===== NEW: Writeoff APIs =====
+
+@app.get("/api/writeoff/daily")
+def api_writeoff_daily(
+    start: str,
+    end: str,
+    warehouse_id: int | None = None,
+    session: Session = Depends(get_session),
+):
+    """
+    Агрегация списаний по дням из sales_daily:
+      total / defect / inventory / other + проценты.
+    """
+    s = datetime.strptime(start, "%Y-%m-%d").date()
+    e = datetime.strptime(end, "%Y-%m-%d").date()
+    stmt = (
+        select(
+            SalesDaily.date.label("date"),
+            Warehouse.name.label("warehouse"),
+            func.sum(SalesDaily.writeoff_cost_total).label("total"),
+            func.sum(SalesDaily.writeoff_cost_defect).label("defect"),
+            func.sum(SalesDaily.writeoff_cost_inventory).label("inventory"),
+            func.sum(SalesDaily.writeoff_cost_other).label("other"),
+        )
+        .join(Warehouse, Warehouse.id == SalesDaily.warehouse_id)
+        .where(SalesDaily.date >= s, SalesDaily.date <= e)
+        .group_by(SalesDaily.date, Warehouse.name)
+        .order_by(SalesDaily.date.asc(), Warehouse.name.asc())
+    )
+    if warehouse_id:
+        stmt = stmt.where(SalesDaily.warehouse_id == warehouse_id)
+
+    rows = session.execute(stmt).fetchall()
+    out = []
+    for r in rows:
+        total = float(r.total or 0)
+        defect = float(r.defect or 0)
+        inventory = float(r.inventory or 0)
+        other = float(r.other or 0)
+        out.append({
+            "date": r.date.isoformat(),
+            "warehouse": r.warehouse,
+            "total": total,
+            "defect": defect,
+            "inventory": inventory,
+            "other": other,
+            "defect_pct": (defect/total*100.0) if total else 0.0,
+            "inventory_pct": (inventory/total*100.0) if total else 0.0,
+            "other_pct": (other/total*100.0) if total else 0.0,
+        })
+    return {"data": out}
+
+@app.get("/api/writeoff/reasons")
+def api_writeoff_reasons(
+    start: str,
+    end: str,
+    warehouse_id: int | None = None,
+    session: Session = Depends(get_session),
+):
+    """
+    Разбивка списаний по причинам из writeoff_daily_reason (как в БД, без нормализации).
+    """
+    from sqlalchemy import text
+    s = datetime.strptime(start, "%Y-%m-%d").date()
+    e = datetime.strptime(end, "%Y-%m-%d").date()
+
+    if warehouse_id:
+        sql = text("""
+          SELECT date, warehouse_id, reason, SUM(cost) AS cost
+          FROM writeoff_daily_reason
+          WHERE date BETWEEN :s AND :e AND warehouse_id = :wid
+          GROUP BY date, warehouse_id, reason
+          ORDER BY date ASC, warehouse_id ASC, reason ASC
+        """)
+        rows = session.execute(sql, {"s": s, "e": e, "wid": warehouse_id}).fetchall()
+    else:
+        sql = text("""
+          SELECT date, warehouse_id, reason, SUM(cost) AS cost
+          FROM writeoff_daily_reason
+          WHERE date BETWEEN :s AND :e
+          GROUP BY date, warehouse_id, reason
+          ORDER BY date ASC, warehouse_id ASC, reason ASC
+        """)
+        rows = session.execute(sql, {"s": s, "e": e}).fetchall()
+
+    wh_map = {w.id: w.name for w in session.query(Warehouse).all()}
+    out = []
+    for r in rows:
+        out.append({
+            "date": r.date.isoformat(),
+            "warehouse_id": int(r.warehouse_id),
+            "warehouse": wh_map.get(int(r.warehouse_id), f"id={r.warehouse_id}"),
+            "reason": r.reason or "",
+            "cost": float(r.cost or 0),
+        })
+    return {"data": out}

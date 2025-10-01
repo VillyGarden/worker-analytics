@@ -26,3 +26,9 @@ data/
 
 # Node (на будущее)
 node_modules/
+
+# Ignore backup files
+*.bak.*
+
+# Ignore backup files
+*.bak.*
