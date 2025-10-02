@@ -18,3 +18,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 def get_session():
     with SessionLocal() as session:
         yield session
+
+# --- added by writeoff backfill ---
+from sqlalchemy import create_engine as _create_engine
+from .config import settings as _settings
+def get_engine():
+    # Универсальный engine для скриптов
+    return _create_engine(_settings.DATABASE_URL, pool_pre_ping=True, future=True)
+# --- end add ---
