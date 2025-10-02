@@ -164,12 +164,25 @@ function sumTotals(a,b){ // sums totals-like objects
     out[k]=(a?.[k]||0)+(b?.[k]||0);
   } return out;
 }
-function sumSeries(a,b){ // align by period and sum revenue
+function sumSeries(a,b){
+
+  // Склеиваем по ключу period и суммируем все основные поля, если они есть
   const map=new Map();
-  for(const r of (a||[])) map.set(r.period, {period:r.period, revenue:r.revenue||0});
+  const take = (obj, k) => {
+    if(!obj) return 0;
+    const v = obj[k];
+    return Number.isFinite(+v) ? (+v) : 0;
+  };
+  const KEYS = ['revenue','cost','discount','returns_cost','inflow_cost','receipts'];
+  for(const r of (a||[])){
+    const row = { period: r.period };
+    for(const k of KEYS) row[k] = take(r,k);
+    map.set(r.period, row);
+  }
   for(const r of (b||[])){
-    const m = map.get(r.period) || {period:r.period, revenue:0};
-    m.revenue += (r.revenue||0); map.set(r.period,m);
+    const m = map.get(r.period) || { period:r.period };
+    for(const k of KEYS) m[k] = (m[k]||0) + take(r,k);
+    map.set(r.period, m);
   }
   return [...map.values()].sort((x,y)=>x.period.localeCompare(y.period));
 }
@@ -191,8 +204,18 @@ async function fetchSummaryTotalsMulti(start,end,group,whIds){
   return out;
 }
 async function fetchSummarySeriesMulti(start,end,group,whIds){
+
   const data=await fetchSummaryTotalsMulti(start,end,group,whIds);
-  return (data.series||[]).map(r=>({period:r.period, revenue:r.revenue||0}));
+  const src = data.series||[];
+  return src.map(r=>({
+    period: r.period,
+    revenue: r.revenue||0,
+    cost: r.cost||0,
+    discount: r.discount||0,
+    returns_cost: r.returns_cost||0,
+    inflow_cost: r.inflow_cost||0,
+    receipts: r.receipts||0
+  }));
 }
 
 // ---- writeoff sums (multi) from /api/writeoff/reasons ----
@@ -218,35 +241,162 @@ function sumWriteoffByBucket(rows, whIds, bucket){ // bucket: 'defect'|'inventor
   return sum;
 }
 
+// === Универсальный сравнительный график: выбор метрик ===
+function ensureCompareMetricToggles(){
+  const chart = document.getElementById('chart-compare');
+  if(!chart) return; // график ещё не в DOM
+  if(document.getElementById('compare-metric-toggles')) return;
+
+  // Родительская карточка, если есть
+  const card = chart.closest('.card');
+  const box  = document.createElement('div');
+  box.id = 'compare-metric-toggles';
+  box.className = 'muted';
+  box.style.cssText = 'margin:8px 0 6px 0; display:flex; gap:12px; flex-wrap:wrap;';
+  box.innerHTML = `
+    <span>Метрики графика:</span>
+    <label><input type="checkbox" name="cmp-metric" value="revenue" checked> Выручка</label>
+    <label><input type="checkbox" name="cmp-metric" value="gross_profit"> Валовая прибыль</label>
+    <label><input type="checkbox" name="cmp-metric" value="margin_pct"> Маржа %</label>
+    <label><input type="checkbox" name="cmp-metric" value="avg_check"> Средний чек</label>
+    <label><input type="checkbox" name="cmp-metric" value="checks_count"> Кол-во чеков</label>
+    <label><input type="checkbox" name="cmp-metric" value="inflow"> Оприходования</label>
+    <label><input type="checkbox" name="cmp-metric" value="defect"> Брак</label>
+    <label><input type="checkbox" name="cmp-metric" value="inventory"> Инвентаризация</label>
+  `;
+
+  // Вставляем ПЕРЕД графиком: если есть .card, то прямо перед chart внутри карточки, иначе в его родителя
+  const parent = chart.parentNode;
+  parent.insertBefore(box, chart);
+
+  // Временная подсказка, чтобы глазами увидеть, что блок появился
+  try{
+    const tip = document.createElement('div');
+    tip.textContent = '✅ Метрики графика готовы';
+    tip.style.cssText = 'font-size:12px;color:#7dd3fc;margin-top:4px;';
+    box.appendChild(tip);
+    setTimeout(()=>{ tip.remove(); }, 8000);
+  }catch(_){}
+
+  box.addEventListener('change', ()=>{ loadCompareChart(); });
+}
+
+function getSelectedCompareMetrics(){
+  const boxes = document.querySelectorAll('#compare-metric-toggles input[name="cmp-metric"]:checked');
+  const list = [...boxes].map(b=>b.value);
+  return list.length ? list : ['revenue'];
+}
+// writeoff helpers for compare series
+async function fetchWriteoffDailyMap(start, end, whIds){
+  const url=new URL('/api/writeoff/daily',location.origin);
+  url.searchParams.set('start',start); url.searchParams.set('end',end);
+  const data=(await jget(url.toString())).data||[];
+  const ids = new Set((whIds||[]).map(String));
+  const f = data.filter(r=> ids.size===0 || ids.has(String(r.warehouse_id)));
+  const days=[...new Set(f.map(r=>r.date))].sort();
+  const m=Object.fromEntries(days.map(d=>[d,{defect:0,inventory:0,total:0}]));
+  for(const r of f){
+    const d=r.date;
+    m[d].defect += r.defect||0;
+    m[d].inventory += r.inventory||0;
+    m[d].total += r.total||0;
+  }
+  return m; // { 'YYYY-MM-DD': {defect, inventory, total} }
+}
+
 async function loadCompareChart(){
+
+  ensureCompareMetricToggles();
+
   const start=document.getElementById('start')?.value;
   const end=document.getElementById('end')?.value;
   const group=document.getElementById('group')?.value || 'day';
   const whIds=getSelectedWarehouseIds();
+  const metrics = getSelectedCompareMetrics();
 
+  // базовые серии из /api/summary (revenue/cost/discount/returns_cost/inflow_cost/receipts)
   const nowSeries=await fetchSummarySeriesMulti(start,end,group,whIds);
-  const xNow=nowSeries.map(r=>r.period); const yNow=nowSeries.map(r=>r.revenue);
+  const xNow=nowSeries.map(r=>r.period);
 
-  const traces=[{x:xNow,y:yNow,type:'scatter',mode:'lines+markers',name:'Текущий период'}];
-
+  // Периоды сравнения
   const doPrev=document.getElementById('cmp-prev-period')?.checked;
   const doYoY=document.getElementById('cmp-prev-year')?.checked;
+  const pp=prevPeriodRange(start,end);
+  const yy=prevYearRange(start,end);
 
-  if(doPrev){
-    const pp=prevPeriodRange(start,end);
-    const prevSeries=await fetchSummarySeriesMulti(pp.start,pp.end,group,whIds);
-    const yPrev=prevSeries.map(r=>r.revenue);
-    traces.push({x:xNow,y:yPrev,type:'scatter',mode:'lines',name:'Пред. период',line:{dash:'dot'}});
+  const prevSeries = doPrev ? await fetchSummarySeriesMulti(pp.start,pp.end,group,whIds) : [];
+  const yoySeries  = doYoY ? await fetchSummarySeriesMulti(yy.start,yy.end,group,whIds) : [];
+
+  // Доп. данные для брака/инвентаризации
+  let woNow={}, woPrev={}, woYoy={};
+  if(metrics.includes('defect') || metrics.includes('inventory')){
+    woNow  = await fetchWriteoffDailyMap(start,end,whIds);
+    if(doPrev) woPrev = await fetchWriteoffDailyMap(pp.start,pp.end,whIds);
+    if(doYoY)  woYoy  = await fetchWriteoffDailyMap(yy.start,yy.end,whIds);
   }
-  if(doYoY){
-    const yy=prevYearRange(start,end);
-    const yoySeries=await fetchSummarySeriesMulti(yy.start,yy.end,group,whIds);
-    const yYoy=yoySeries.map(r=>r.revenue);
-    traces.push({x:xNow,y:yYoy,type:'scatter',mode:'lines',name:'Год назад',line:{dash:'dash'}});
+
+  // Метрики
+  const access = {
+    revenue: (r)=> r.revenue||0,
+    gross_profit: (r)=> (r.revenue||0) - (r.cost||0),
+    margin_pct: (r)=> (r.revenue ? (( (r.revenue - (r.cost||0) - (r.discount||0) - (r.returns_cost||0)) / r.revenue) * 100) : 0),
+    avg_check: (r)=> (r.receipts ? (r.revenue / r.receipts) : 0),
+    checks_count: (r)=> r.receipts||0,
+    inflow: (r)=> r.inflow_cost||0
+  };
+  function accessWriteoff(day, kind, map){ // kind: defect|inventory
+    const row = map[day]; if(!row) return 0;
+    return (kind==='defect'? row.defect : row.inventory) || 0;
+  }
+  const units = {
+    revenue: '₽', gross_profit: '₽', margin_pct: '%', avg_check: '₽', checks_count: 'шт', inflow: '₽',
+    defect: '₽', inventory: '₽'
+  };
+  const names = {
+    revenue: 'Выручка', gross_profit: 'Валовая прибыль', margin_pct: 'Маржа %',
+    avg_check: 'Средний чек', checks_count: 'Кол-во чеков', inflow: 'Оприходования',
+    defect: 'Брак', inventory: 'Инвентаризация'
+  };
+
+  const traces=[];
+
+  const pushMetric = (key, seriesNow, seriesPrev, seriesYoy)=>{
+    traces.push({x:xNow, y:xNow.map((d,i)=>{
+      if(key==='defect'||key==='inventory') return accessWriteoff(d, key, woNow);
+      const r = seriesNow[i]||{};
+      return (access[key]||(()=>0))(r);
+    }), type:'scatter', mode:'lines+markers', name: names[key]+' (текущий)' });
+
+    if(doPrev){
+      const yPrev = xNow.map((d,i)=>{
+        if(key==='defect'||key==='inventory') return accessWriteoff(d, key, woPrev);
+        const r = seriesPrev[i]||{};
+        return (access[key]||(()=>0))(r);
+      });
+      traces.push({x:xNow, y:yPrev, type:'scatter', mode:'lines', name:names[key]+' (пред.)', line:{dash:'dot'}});
+    }
+
+    if(doYoY){
+      const yYoy = xNow.map((d,i)=>{
+        if(key==='defect'||key==='inventory') return accessWriteoff(d, key, woYoy);
+        const r = seriesYoy[i]||{};
+        return (access[key]||(()=>0))(r);
+      });
+      traces.push({x:xNow, y:yYoy, type:'scatter', mode:'lines', name:names[key]+' (год назад)', line:{dash:'dash'}});
+    }
+  };
+
+  // Выравниваем prev/yoy длиной под текущий период
+  const pad = (arr)=>{ const a=(arr||[]).slice(0,xNow.length); while(a.length<xNow.length) a.push({}); return a; };
+  const prevPad = pad(prevSeries);
+  const yoyPad  = pad(yoySeries);
+
+  for(const key of metrics){
+    pushMetric(key, nowSeries, prevPad, yoyPad);
   }
 
   if(window.Plotly){
-    const yTitle = 'Выручка ₽' + (group==='day'?' (по дням)': group==='month'?' (по месяцам)':' (итоги по годам)');
+    const yTitle = metrics.length===1 ? (names[metrics[0]] + ' ' + (units[metrics[0]]||'')) : 'Значение';
     Plotly.newPlot('chart-compare', traces, {
       paper_bgcolor:'#0b0c10', plot_bgcolor:'#0b0c10',
       xaxis:{gridcolor:'#222831', title:(group==='day'?'Дни':'Периоды')},
@@ -494,9 +644,384 @@ async function boot(){
     setPeriodCurrentMonth();
     await loadWarehouses();
     await loadChartsAndKPI();
+    ensureCompareMetricToggles();
     wireQuickButtons();
     addChartToggles();
     await loadComparison();
+    try{ ensureCompareMetricToggles(); }catch(e){}
   }catch(e){ console.error('dashboard boot failed', e); }
 }
 document.addEventListener('DOMContentLoaded', boot);
+
+// === [WA] compare-toggles injector v1 ===
+(function(){
+  try {
+    console.log('[WA] compare-toggles injector alive');
+
+    function insertToggles() {
+      const chart = document.getElementById('chart-compare');
+      if (!chart) return false;
+      if (document.getElementById('compare-metric-toggles')) return true;
+
+      const box = document.createElement('div');
+      box.id = 'compare-metric-toggles';
+      box.className = 'muted';
+      box.style.cssText = 'margin:8px 0 6px 0; display:flex; gap:12px; flex-wrap:wrap;';
+      box.innerHTML = `
+        <span>Метрики графика:</span>
+        <label><input type="checkbox" name="cmp-metric" value="revenue" checked> Выручка</label>
+        <label><input type="checkbox" name="cmp-metric" value="gross_profit"> Валовая прибыль</label>
+        <label><input type="checkbox" name="cmp-metric" value="margin_pct"> Маржа %</label>
+        <label><input type="checkbox" name="cmp-metric" value="avg_check"> Средний чек</label>
+        <label><input type="checkbox" name="cmp-metric" value="checks_count"> Кол-во чеков</label>
+        <label><input type="checkbox" name="cmp-metric" value="inflow"> Оприходования</label>
+        <label><input type="checkbox" name="cmp-metric" value="defect"> Брак</label>
+        <label><input type="checkbox" name="cmp-metric" value="inventory"> Инвентаризация</label>
+      `;
+      // Вставляем ПЕРЕД графиком
+      chart.parentNode.insertBefore(box, chart);
+      box.addEventListener('change', function(){
+        if (typeof loadCompareChart === 'function') {
+          try { loadCompareChart(); } catch(e){ console.warn('loadCompareChart failed', e); }
+        }
+      });
+
+      // маленькая подсказка, чтобы глазами увидеть, что патч активен
+      const tip = document.createElement('div');
+      tip.textContent = '✅ Метрики графика готовы';
+      tip.style.cssText = 'font-size:12px;color:#7dd3fc;margin-top:4px;';
+      box.appendChild(tip);
+      setTimeout(()=>{ try{ tip.remove(); }catch(_){ } }, 6000);
+
+      return true;
+    }
+
+    // Пробуем сразу и по готовности DOM
+    document.addEventListener('DOMContentLoaded', insertToggles);
+    setTimeout(insertToggles, 500);
+    setTimeout(insertToggles, 1500);
+
+    // Следим за изменениями DOM, чтобы не потерять блок при перерисовках
+    const mo = new MutationObserver(() => { insertToggles(); });
+    mo.observe(document.documentElement, { subtree:true, childList:true });
+  } catch(e) {
+    console.error('[WA] injector error', e);
+  }
+})();
+/// === end injector ===
+
+// === [WA] persist compare metric toggles ===
+(function(){
+  try{
+    const KEY='wa_cmp_metrics';
+    function restore(){
+      const box = document.getElementById('compare-metric-toggles');
+      if(!box) return;
+      // восстановим сохранённый набор метрик
+      let saved=[];
+      try{ saved = JSON.parse(localStorage.getItem(KEY)||'[]') || []; }catch(_){}
+      if(saved.length){
+        box.querySelectorAll('input[name="cmp-metric"]').forEach(i=>{
+          i.checked = saved.includes(i.value);
+        });
+        if(typeof loadCompareChart==='function'){
+          try{ loadCompareChart(); }catch(_){}
+        }
+      }
+      // сохраняем при каждом изменении
+      box.addEventListener('change', ()=>{
+        const sel=[...box.querySelectorAll('input[name="cmp-metric"]:checked')].map(i=>i.value);
+        try{ localStorage.setItem(KEY, JSON.stringify(sel)); }catch(_){}
+      }, {once:false});
+    }
+    document.addEventListener('DOMContentLoaded', ()=>setTimeout(restore, 150));
+    setTimeout(restore, 800);
+  }catch(e){ console.warn('[WA] persist error', e); }
+})();
+// === end persist ===
+
+// === [WA] dual-axis for percent metrics on compare chart ===
+(function(){
+  function wrapOnce(){
+    if(typeof window.loadCompareChart !== 'function') return false;
+    if(window.__wa_patched_compare__) return true;
+    const orig = window.loadCompareChart;
+    window.loadCompareChart = async function(){
+      // рисуем как обычно
+      await orig.apply(this, arguments);
+      try{
+        const el = document.getElementById('chart-compare');
+        if(!el || !window.Plotly) return;
+
+        const data = (el.data || []).map(tr => ({...tr}));
+        const hasPct = data.some(tr => /Маржа\s*%/i.test(String(tr.name||'')));
+        if(!hasPct) return; // нечего городить вторую ось
+
+        // Переносим серии с «Маржа %» на ось y2
+        for(const tr of data){
+          if(/Маржа\s*%/i.test(String(tr.name||''))){
+            tr.yaxis = 'y2';
+            // Линии процентов оставляем как lines (без маркеров), если вдруг кто-то включил
+            if(tr.type === 'scatter') tr.mode = 'lines';
+          }
+        }
+
+        // Собираем новый layout на основе текущего
+        const layout = JSON.parse(JSON.stringify(el.layout || {}));
+        layout.yaxis = Object.assign({title:'Значение', gridcolor:'#222831'}, layout.yaxis||{});
+        layout.yaxis2 = Object.assign({
+          title: 'Проценты %',
+          overlaying: 'y',
+          side: 'right',
+          gridcolor: layout.yaxis.gridcolor || '#222831'
+        }, layout.yaxis2||{});
+
+        // Перерисовываем обновлённой конфигурацией
+        await Plotly.react(el, data, layout, {displayModeBar:false, responsive:true});
+      }catch(e){
+        console.debug('[WA] dual-axis patch skipped:', e);
+      }
+    };
+    window.__wa_patched_compare__ = true;
+    return true;
+  }
+
+  // Пытаемся обернуть сразу и потом ещё пару раз, вдруг дашборд ленивый
+  if(!wrapOnce()){
+    const t1 = setInterval(()=>{ if(wrapOnce()) clearInterval(t1); }, 200);
+    setTimeout(()=> clearInterval(t1), 4000);
+  }
+})();
+/// === end dual-axis ===
+
+// === [WA] Export "Сравнительный график" в CSV ===
+(function(){
+  function toCSVCell(v){
+    if(v==null) return '';
+    if(typeof v === 'number' && isFinite(v)) return String(v).replace('.', ','); // удобно для Excel RU
+    const s = String(v);
+    return /[",;\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function exportCompareCSV(){
+    const el = document.getElementById('chart-compare');
+    if(!el || !el.data) return;
+
+    // Колонки: Date + все серии графика (имя серии как заголовок)
+    const x = (el.data[0]?.x || []).map(d => d); // даты текущего периода — база
+    const headers = ['date', ...el.data.map(tr => tr.name || 'series')];
+
+    const rows = [];
+    for(let i=0;i<x.length;i++){
+      const row = [x[i]];
+      for(const tr of el.data){
+        const y = Array.isArray(tr.y) ? tr.y[i] : null;
+        row.push(y ?? '');
+      }
+      rows.push(row);
+    }
+
+    // Собираем CSV (UTF-8 BOM чтобы Excel не корчил «иерароглифы»)
+    const lines = [headers, ...rows].map(r => r.map(toCSVCell).join(';')).join('\n');
+    const blob = new Blob(["\uFEFF"+lines], {type:'text/csv;charset=utf-8;'});
+    const a = document.createElement('a');
+    const start = document.getElementById('start')?.value || '';
+    const end   = document.getElementById('end')?.value || '';
+    a.download = `comparison_${start}_${end}.csv`;
+    a.href = URL.createObjectURL(blob);
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+
+  function ensureExportButton(){
+    const panel = document.getElementById('compare-metric-toggles');
+    if(!panel) return false;
+    if(document.getElementById('compare-export-csv')) return true;
+
+    const btn = document.createElement('button');
+    btn.id = 'compare-export-csv';
+    btn.textContent = 'Экспорт CSV';
+    btn.style.cssText = 'margin-left:8px;padding:4px 8px;border:1px solid #334155;background:#0b0c10;color:#e5e7eb;border-radius:6px;cursor:pointer;';
+    btn.addEventListener('click', (e)=>{ e.preventDefault(); try{ exportCompareCSV(); }catch(err){ console.warn('CSV export failed', err); } });
+    panel.appendChild(btn);
+    return true;
+  }
+
+  // Пытаемся воткнуть кнопку: при загрузке и при мутациях DOM
+  document.addEventListener('DOMContentLoaded', ()=> setTimeout(ensureExportButton, 300));
+  setTimeout(ensureExportButton, 1200);
+  const mo = new MutationObserver(()=> ensureExportButton());
+  mo.observe(document.documentElement, {subtree:true, childList:true});
+})();
+/// === end export ===
+
+// === [WA] PNG export + persist compare period flags ===
+(function(){
+  // 1) Кнопка PNG рядом с «Экспорт CSV»
+  function ensurePngButton(){
+    const panel = document.getElementById('compare-metric-toggles');
+    if(!panel) return false;
+    if(document.getElementById('compare-export-png')) return true;
+
+    const btn = document.createElement('button');
+    btn.id = 'compare-export-png';
+    btn.textContent = 'PNG';
+    btn.style.cssText = 'margin-left:8px;padding:4px 8px;border:1px solid #334155;background:#0b0c10;color:#e5e7eb;border-radius:6px;cursor:pointer;';
+    btn.title = 'Скачать график как PNG';
+    btn.addEventListener('click', async (e)=>{
+      e.preventDefault();
+      try{
+        const el = document.getElementById('chart-compare');
+        if(!el || !window.Plotly) return;
+        const start = document.getElementById('start')?.value || '';
+        const end   = document.getElementById('end')?.value || '';
+        const url = await Plotly.toImage(el, {format:'png', width:1200, height:600, scale:2});
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `comparison_${start}_${end}.png`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(()=>{ a.remove(); }, 300);
+      }catch(err){ console.warn('[WA] PNG export failed', err); }
+    });
+    panel.appendChild(btn);
+    return true;
+  }
+
+  // 2) Запоминаем флажки «предыдущий период» и «год назад»
+  const KEY_FLAGS='wa_cmp_flags';
+  function saveFlags(){
+    try{
+      const prev = document.getElementById('cmp-prev-period');
+      const yoy  = document.getElementById('cmp-prev-year');
+      if(!prev || !yoy) return;
+      const val = {prev: !!prev.checked, yoy: !!yoy.checked};
+      localStorage.setItem(KEY_FLAGS, JSON.stringify(val));
+    }catch(_){}
+  }
+  function restoreFlags(){
+    try{
+      const prev = document.getElementById('cmp-prev-period');
+      const yoy  = document.getElementById('cmp-prev-year');
+      if(!prev || !yoy) return;
+      const raw = localStorage.getItem(KEY_FLAGS);
+      if(!raw) return;
+      const {prev:pv=false, yoy:yy=false} = JSON.parse(raw)||{};
+      prev.checked = !!pv;
+      yoy.checked  = !!yy;
+      if(typeof loadCompareChart==='function'){
+        try{ loadCompareChart(); }catch(_){}
+      }
+    }catch(_){}
+  }
+
+  // Втыкаем кнопу PNG и восстанавливаем флаги
+  document.addEventListener('DOMContentLoaded', ()=>{
+    setTimeout(()=>{ ensurePngButton(); restoreFlags(); }, 300);
+  });
+  // Подстрахуемся на случай ленивой перерисовки
+  setTimeout(()=>{ ensurePngButton(); restoreFlags(); }, 1200);
+
+  // Сохраняем при любом клике по этим двум чекбоксам
+  document.addEventListener('change', (e)=>{
+    const id = (e.target && e.target.id) || '';
+    if(id==='cmp-prev-period' || id==='cmp-prev-year') saveFlags();
+  });
+
+  // При перерисовке графика пробуем ещё раз
+  const mo = new MutationObserver(()=>{ ensurePngButton(); });
+  mo.observe(document.documentElement, {subtree:true, childList:true});
+})();
+/// === end (PNG + flags) ===
+
+// === [WA] Сглаживание 7д для сравнит-графика + сохранение флага ===
+(function(){
+  const KEY='wa_cmp_smooth';
+
+  function sma(arr, win){
+    const n = arr.length, out = new Array(n).fill(null);
+    let sum = 0, q = [];
+    for(let i=0;i<n;i++){
+      const v = Number.isFinite(+arr[i]) ? +arr[i] : null;
+      q.push(v);
+      if(v!=null) sum += v;
+      if(q.length > win){
+        const dropped = q.shift();
+        if(dropped!=null) sum -= dropped;
+      }
+      const denom = q.filter(x=>x!=null).length;
+      out[i] = denom ? +(sum/denom) : null;
+    }
+    return out;
+  }
+
+  function ensureSmoothToggle(){
+    const panel = document.getElementById('compare-metric-toggles');
+    if(!panel) return false;
+    if(document.getElementById('compare-smooth-7d')) return true;
+
+    const wrap = document.createElement('span');
+    wrap.style.cssText = 'margin-left:8px;';
+    wrap.innerHTML = '<label title="Скользящее среднее по 7 точкам"><input type="checkbox" id="compare-smooth-7d"> Сглаживание 7д</label>';
+    panel.appendChild(wrap);
+
+    // восстановим сохранённое значение
+    try{
+      const saved = JSON.parse(localStorage.getItem(KEY) || 'false');
+      const cb = document.getElementById('compare-smooth-7d');
+      cb.checked = !!saved;
+      cb.addEventListener('change', ()=>{
+        try{ localStorage.setItem(KEY, JSON.stringify(cb.checked)); }catch(_){}
+        if(typeof loadCompareChart==='function'){ try{ loadCompareChart(); }catch(_){} }
+      });
+    }catch(_){}
+
+    return true;
+  }
+
+  // обёртка над loadCompareChart: после его отрисовки применяем сглаживание и перерисовываем
+  function wrapOnce(){
+    if(typeof window.loadCompareChart !== 'function') return false;
+    if(window.__wa_smooth_patched__) return true;
+
+    const orig = window.loadCompareChart;
+    window.loadCompareChart = async function(){
+      await orig.apply(this, arguments);
+
+      const cb = document.getElementById('compare-smooth-7d');
+      const enabled = !!(cb && cb.checked);
+      if(!enabled) return;
+
+      const el = document.getElementById('chart-compare');
+      if(!el || !window.Plotly) return;
+
+      try{
+        // клон данных
+        const data = (el.data || []).map(tr => ({...tr}));
+        // сглаживаем только линейные ряды (scatter), бары не трогаем
+        for(const tr of data){
+          if((tr.type||'') === 'scatter' && Array.isArray(tr.y)){
+            const y = tr.y.map(v => Number.isFinite(+v) ? +v : null);
+            tr.y = sma(y, 7);
+            // пометим в названии
+            const nm = String(tr.name||'');
+            if(!/SMA7/.test(nm)) tr.name = nm + ' (SMA7)';
+          }
+        }
+        const layout = el.layout || {};
+        await Plotly.react(el, data, layout, {displayModeBar:false,responsive:true});
+      }catch(e){
+        console.debug('[WA] smooth patch skipped:', e);
+      }
+    };
+    window.__wa_smooth_patched__ = true;
+    return true;
+  }
+
+  document.addEventListener('DOMContentLoaded', ()=>{
+    setTimeout(ensureSmoothToggle, 300);
+    const t = setInterval(()=>{ if(ensureSmoothToggle() && wrapOnce()) clearInterval(t); }, 200);
+    setTimeout(()=> clearInterval(t), 4000);
+  });
+})();
+/// === end smooth ===
