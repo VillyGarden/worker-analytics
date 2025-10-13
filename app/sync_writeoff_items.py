@@ -1,0 +1,159 @@
+import asyncio, httpx
+from datetime import date, timedelta
+from typing import Dict, Any, List
+from sqlalchemy import text
+from app.config import settings
+from app.db import get_session
+from contextlib import contextmanager as _cm
+from app.db import get_session as _get_session
+
+@_cm
+def session_cm():
+    gen = _get_session()
+    s = next(gen)
+    try:
+        yield s
+    finally:
+        try:
+            # корректно закрыть генератор get_session()
+            next(gen)
+        except StopIteration:
+            pass
+MS_BASE = settings.MS_BASE_URL.rstrip("/")
+
+def reason_from_doc(doc: Dict[str, Any]) -> str:
+    for a in (doc.get("attributes") or []):
+        name = (a.get("name") or "").lower()
+        val  = a.get("value")
+        sval = (str(val or "")).lower() if isinstance(val, (str,int,float)) else ""
+        if "причин" in name or "reason" in name:
+            if "брак" in sval: return "Брак"
+            if "инвент" in sval: return "Инвентаризация"
+    nm = (doc.get("name") or "").lower()
+    desc= (doc.get("description") or "").lower()
+    if "инвент" in nm or "инвент" in desc: return "Инвентаризация"
+    return "Брак"
+
+def rub_from_value(v):
+    try:
+        return round(float(v or 0)/100.0, 4)
+    except Exception:
+        return 0.0
+
+async def fetch_json(ac, url, **params):
+    while True:
+        r = await ac.get(url, params=params or None)
+        if r.status_code == 429:
+            print("‼️ 429 Too Many Requests — сплю 20с и повторяю…", url)
+            await asyncio.sleep(20)
+            continue
+        r.raise_for_status()
+        return r.json()
+
+async def fetch_loss_docs(ac: httpx.AsyncClient, store_href: str, day: date) -> List[Dict[str, Any]]:
+    params = {
+        "limit": 100, "offset": 0,
+        "filter": f"moment>={day} 00:00:00;moment<={day} 23:59:59;store={store_href}",
+        "expand": "attributes",
+        "order": "moment",
+    }
+    res = []
+    while True:
+        data = await fetch_json(ac, f"{MS_BASE}/entity/loss", **params)
+        rows = data.get("rows") or []
+        res.extend(rows)
+        if len(rows) < params["limit"]:
+            break
+        params["offset"] += params["limit"]
+    return res
+
+async def fetch_positions(ac: httpx.AsyncClient, doc_href: str) -> List[Dict[str, Any]]:
+    data = await fetch_json(ac, f"{doc_href}/positions", limit=1000, expand="assortment")
+    return data.get("rows") or []
+
+_product_bp_cache: Dict[str, float] = {}
+
+async def get_product_buy_price(ac: httpx.AsyncClient, product_href: str) -> float:
+    if not product_href:
+        return 0.0
+    if product_href in _product_bp_cache:
+        return _product_bp_cache[product_href]
+    data = await fetch_json(ac, product_href)
+    bp = 0.0
+    if "buyPrice" in data:
+        v = data["buyPrice"]
+        if isinstance(v, dict) and "value" in v:
+            bp = rub_from_value(v["value"])
+        else:
+            bp = rub_from_value(v)
+    _product_bp_cache[product_href] = bp
+    return bp
+
+async def resolve_buy_price(ac: httpx.AsyncClient, pos: Dict[str, Any]) -> float:
+    # 1) buyPrice прямо в позиции
+    v = ((pos.get("buyPrice") or {}) or {}).get("value")
+    if v:
+        return rub_from_value(v)
+    # 2) buyPrice в assortment (variant/product)
+    ass = pos.get("assortment") or {}
+    if "buyPrice" in ass:
+        vv = ass["buyPrice"]
+        if isinstance(vv, dict) and "value" in vv:
+            return rub_from_value(vv["value"])
+        else:
+            return rub_from_value(vv)
+    # 3) buyPrice товара (для variant берём .product.href)
+    meta = (ass.get("meta") or {})
+    if meta.get("type") == "variant":
+        href = (((ass.get("product") or {}).get("meta") or {}).get("href")) or ""
+    else:
+        href = meta.get("href") or ""
+    return await get_product_buy_price(ac, href)
+
+async def run_range(start: date, end: date):
+    headers = {"Authorization": f"Bearer {settings.MS_API_TOKEN}", "Accept":"application/json;charset=utf-8"}
+    async with httpx.AsyncClient(timeout=60.0, headers=headers) as ac:
+        # БД-сессия — обычный sync context manager
+with session_cm() as s:
+                       stores = s.execute(text("SELECT id, ms_id, name FROM warehouse WHERE ms_id IS NOT NULL")).mappings().all()
+            stores = [{"id": r["id"], "href": f"{MS_BASE}/entity/store/{r['ms_id']}", "name": r["name"]} for r in stores]
+
+            cur = start
+            while cur <= end:
+                for st in stores:
+                    docs = await fetch_loss_docs(ac, st["href"], cur)
+                    # чистим на день/склад
+                    s.execute(text("DELETE FROM writeoff_item WHERE day=:d AND warehouse_id=:wid"),
+                              {"d": cur, "wid": st["id"]})
+                    ins = []
+                    for d in docs:
+                        doc_id   = d.get("id")
+                        doc_href = d.get("meta",{}).get("href")
+                        reason   = reason_from_doc(d)
+                        for p in (await fetch_positions(ac, doc_href)):
+                            qty = float(p.get("quantity") or 0)
+                            bp  = await resolve_buy_price(ac, p)   # RUB
+                            cost= round(qty * bp, 2)
+                            ass = p.get("assortment") or {}
+                            ins.append({
+                                "d": cur, "wid": st["id"], "wname": st["name"],
+                                "doc_id": doc_id, "pos_id": p.get("id"),
+                                "pid": ass.get("id"), "pcode": ass.get("code"), "pname": ass.get("name"),
+                                "reason": reason, "qty": qty, "bp": bp, "cost": cost
+                            })
+                    if ins:
+                        s.execute(text("""
+                            INSERT INTO writeoff_item
+                            (day, warehouse_id, warehouse_name, doc_id, position_id, product_id, product_code, product_name, reason, qty, buy_price, cost)
+                            VALUES
+                            (:d, :wid, :wname, :doc_id, :pos_id, :pid, :pcode, :pname, :reason, :qty, :bp, :cost)
+                        """), ins)
+                    s.commit()
+                print(f"[OK] {cur} done")
+            cur += timedelta(days=1)
+
+if __name__ == "__main__":
+    import os
+    s = date.fromisoformat(os.environ.get("START") or "2019-01-01")
+    e = date.fromisoformat(os.environ.get("END")   or date.today().isoformat())
+    asyncio.run(run_range(s, e))

@@ -1,0 +1,29 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+class Settings(BaseSettings):
+    SECRET_KEY: str | None = None
+    ADMIN_USERNAME: str | None = None
+    ADMIN_PASSWORD: str | None = None
+    MS_API_TOKEN: str | None = None
+    MS_BASE_URL: str | None = 'https://api.moysklad.ru/api/remap/1.2'
+    # читаем .env, игнорируем лишние переменные, учитываем регистр
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=True,
+    )
+
+    # DB_* переменные — в верхнем регистре, как у тебя в .env
+    DB_HOST: str = Field(default="localhost")
+    DB_PORT: int = Field(default=5432)
+    DB_NAME: str = Field(default="worker_analytics")
+    DB_USER: str = Field(default="worker")
+    DB_PASS: str = Field(default="worker_pass")
+
+    # Токен МойСклад (не обязателен для импорта конфига)
+    MS_TOKEN: str | None = None
+
+# экземпляр настроек
+settings = Settings()

@@ -1,0 +1,177 @@
+import os, datetime as dt, time, random, requests
+from decimal import Decimal, ROUND_HALF_UP
+from sqlalchemy import text
+from app.db import SessionLocal
+
+API = os.getenv("MS_BASE_URL", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
+
+def _env(name):
+    v = os.getenv(name)
+    if v: return v
+    try:
+        from pathlib import Path
+        for line in Path(".env").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line or line.lstrip().startswith("#"): continue
+            if line.split("=",1)[0].strip()==name:
+                val = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                return val
+    except Exception:
+        pass
+    return None
+
+def _jget(url, headers, params=None, tries=0, timeout=60):
+    r = requests.get(url, headers=headers, params=params, timeout=timeout)
+    if r.status_code in (429,500,502,503) and tries < 5:
+        ra = r.headers.get("Retry-After")
+        try:
+            delay = float(ra) if ra else min(2**tries, 30) + random.uniform(0, 0.3)
+        except Exception:
+            delay = min(2**tries, 30) + random.uniform(0, 0.3)
+        time.sleep(delay)
+        return _jget(url, headers, params=params, tries=tries+1, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_enters_day(day: dt.date, token: str):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json;charset=utf-8",
+        "Content-Type": "application/json",
+        "User-Agent": "worker-analytics/load-enter-day"
+    }
+    next_day = day + dt.timedelta(days=1)
+    filt = f"moment>={day} 00:00:00;moment<{next_day} 00:00:00"
+    url = f"{API}/entity/enter"
+    params = {"limit": 1000, "expand":"store", "filter": filt}
+    rows = []
+    while True:
+        data = _jget(url, headers=headers, params=params)
+        rows.extend(data.get("rows", []))
+        next_href = (data.get("meta") or {}).get("nextHref")
+        if not next_href: break
+        url, params = next_href, None
+    return rows, headers
+
+def fetch_positions(doc: dict, headers: dict):
+    # если expand не дал rows, берём по ссылке
+    pos = (doc.get("positions") or {})
+    if "rows" in pos and pos["rows"]:
+        return pos["rows"]
+    href = (pos.get("meta") or {}).get("href")
+    if not href:
+        return []
+    out = []
+    url = href
+    params = {"limit": 1000}
+    while True:
+        data = _jget(url, headers=headers, params=params)
+        out.extend(data.get("rows", []))
+        next_href = (data.get("meta") or {}).get("nextHref")
+        if not next_href: break
+        url, params = next_href, None
+    return out
+
+def last_uuid_from_href(href: str):
+    try:
+        return href.rstrip("/").split("/")[-1]
+    except Exception:
+        return None
+
+
+def upsert_positions(db, day: dt.date, doc: dict, positions: list):
+    # поля: position_id (uuid PK), doc_id (uuid), date, warehouse_id(uuid), product_id(uuid), qty, price, cost, inventory_based
+    doc_id = doc.get("id")
+    moment = (doc.get("moment") or "")[:10]
+    date = moment or day.isoformat()
+    wh_id = None
+    store = doc.get("store")
+    if store and "meta" in store:
+        wh_id = last_uuid_from_href(store["meta"].get("href",""))
+
+    inv_flag = bool(doc.get("inventory"))
+
+    ins = text("""
+        INSERT INTO inflow_item_fact
+          (position_id, doc_id, date, warehouse_id, product_id, qty, price, cost, inventory_based)
+        VALUES
+          (:position_id, :doc_id, :date, :warehouse_id, :product_id, :qty, :price, :cost, :inventory_based)
+        ON CONFLICT (position_id) DO UPDATE SET
+          doc_id = EXCLUDED.doc_id,
+          date = EXCLUDED.date,
+          warehouse_id = EXCLUDED.warehouse_id,
+          product_id = EXCLUDED.product_id,
+          qty = EXCLUDED.qty,
+          price = EXCLUDED.price,
+          cost = EXCLUDED.cost,
+          inventory_based = EXCLUDED.inventory_based,
+          updated_at = now()
+    """)
+
+    n = 0
+    for p in positions:
+        pid = p.get("id")
+        ass = p.get("assortment") or {}
+        meta = ass.get("meta") or {}
+        prod_id = last_uuid_from_href(meta.get("href","")) if meta else None
+
+        # базовые числа
+        qty = Decimal(str(p.get("quantity") or 0))
+        price_cents = p.get("price") or 0
+        sum_cents = p.get("sum")  # может быть None или 0
+
+        # цена в рублях
+        price = Decimal(price_cents) / Decimal(100)
+
+        # если sum пустой или 0, считаем total = price * qty
+        if not sum_cents or int(sum_cents) == 0:
+            total = price * qty
+        else:
+            total = Decimal(sum_cents) / Decimal(100)
+
+        # нормализация округлений
+        price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        # обязательные ключи
+        if not pid or not prod_id or not wh_id:
+            continue
+
+        db.execute(ins, {
+            "position_id": pid,
+            "doc_id": doc_id,
+            "date": date,
+            "warehouse_id": wh_id,
+            "product_id": prod_id,
+            "qty": float(qty),
+            "price": float(price),
+            "cost": float(total),
+            "inventory_based": inv_flag,
+        })
+        n += 1
+    return n
+def main():
+    day_s = os.getenv("DAY") or os.getenv("START")
+    if not day_s:
+        raise SystemExit("Укажи DAY=YYYY-MM-DD")
+    day = dt.date.fromisoformat(day_s)
+    token = _env("MS_TOKEN") or _env("MS_API_TOKEN")
+    if not token:
+        raise SystemExit("Нет MS_TOKEN/MS_API_TOKEN ни в окружении, ни в .env")
+
+    docs, headers = fetch_enters_day(day, token)
+    print(f"[enter] {day}: {len(docs)} документов")
+
+    total_pos = 0
+    with SessionLocal() as db:
+        db.execute(text("SELECT 1"))
+        for i, d in enumerate(docs, 1):
+            rows = fetch_positions(d, headers)
+            cnt = upsert_positions(db, day, d, rows)
+            total_pos += cnt
+            if i % 5 == 0:
+                db.commit()
+        db.commit()
+    print(f"[done] upsert позиций: {total_pos}")
+
+if __name__ == "__main__":
+    main()

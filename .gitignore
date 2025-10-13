@@ -1,0 +1,12 @@
+.env
+*.pyc
+__pycache__/
+logs/
+tmp/
+*.log
+*.tsv
+*.json
+.DS_Store
+.env
+.env.*
+*.env

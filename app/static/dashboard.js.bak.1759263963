@@ -1,0 +1,396 @@
+// Worker Analytics Dashboard — v8
+
+function fmt(x){return (x??0).toLocaleString('ru-RU',{minimumFractionDigits:2, maximumFractionDigits:2});}
+function pctDelta(a,b){ if(!isFinite(a)||!isFinite(b)||b===0) return NaN; return (a/b*100-100); }
+function cls(n){ return isFinite(n) ? (n>=0?'good':'bad') : ''; }
+function toISO(d){ const z=new Date(d); z.setHours(0,0,0,0); return `${z.getFullYear()}-${String(z.getMonth()+1).padStart(2,'0')}-${String(z.getDate()).padStart(2,'0')}`; }
+const parseISO=(s)=>{ const [y,m,dd]=s.split('-').map(Number); const d=new Date(y, m-1, dd); d.setHours(0,0,0,0); return d; };
+function lastDayOfMonth(y,m){ return new Date(y, m+1, 0); }
+
+function setPeriodCurrentMonth(){
+  const now=new Date();
+  const start=new Date(now.getFullYear(), now.getMonth(), 1);
+  const end=lastDayOfMonth(now.getFullYear(), now.getMonth());
+  start.setHours(0,0,0,0); end.setHours(0,0,0,0);
+  document.getElementById('start').value=toISO(start);
+  document.getElementById('end').value=toISO(end);
+}
+function setPeriodPrevMonth(){
+  const now=new Date();
+  const prevFirst=new Date(now.getFullYear(), now.getMonth()-1, 1);
+  const prevLast=lastDayOfMonth(prevFirst.getFullYear(), prevFirst.getMonth());
+  prevFirst.setHours(0,0,0,0); prevLast.setHours(0,0,0,0);
+  document.getElementById('start').value=toISO(prevFirst);
+  document.getElementById('end').value=toISO(prevLast);
+}
+function setPeriodYTD(){ // до вчера
+  const now=new Date();
+  const start=new Date(now.getFullYear(),0,1);
+  const end=new Date(now); end.setDate(end.getDate()-1);
+  start.setHours(0,0,0,0); end.setHours(0,0,0,0);
+  document.getElementById('start').value=toISO(start);
+  document.getElementById('end').value=toISO(end);
+}
+function setPeriodPrevYear(){
+  const y=(new Date()).getFullYear()-1;
+  const start=new Date(y,0,1), end=new Date(y,11,31);
+  start.setHours(0,0,0,0); end.setHours(0,0,0,0);
+  document.getElementById('start').value=toISO(start);
+  document.getElementById('end').value=toISO(end);
+}
+
+function rangeDays(startISO,endISO){
+  const s=parseISO(startISO), e=parseISO(endISO);
+  const days=[]; let d=new Date(s);
+  while(d<=e){ days.push(toISO(d)); d.setDate(d.getDate()+1); }
+  return days;
+}
+async function jget(url){ const r=await fetch(url,{credentials:'include'}); if(!r.ok) throw new Error(url+' -> '+r.status); return r.json(); }
+function by(arr,key){ const m={}; for(const r of arr){ const k=r[key]; (m[k] ||= []).push(r); } return m; }
+
+window.__WAREHOUSES__=[];
+
+async function loadWarehouses(){
+  try{
+    const res=await jget('/api/warehouses'); window.__WAREHOUSES__=res.data||[];
+    const sel=document.getElementById('warehouse');
+    if(sel && sel.options.length<=1){
+      for(const w of window.__WAREHOUSES__){
+        const opt=document.createElement('option'); opt.value=String(w.id); opt.textContent=w.name; sel.appendChild(opt);
+      }
+    }
+  }catch(e){ console.error('warehouses load failed', e); }
+}
+
+async function loadChartsAndKPI(){
+  const [rev, mar, inf] = await Promise.all([
+    jget('/api/revenue/daily?days=60'),
+    jget('/api/margin/daily?days=60'),
+    jget('/api/inflow/daily?days=60'),
+  ]);
+  const revRows = rev.data||[], marRows = mar.data||[], infRows = inf.data||[];
+
+  const from7 = (()=>{const d=new Date(); d.setDate(d.getDate()-6); d.setHours(0,0,0,0); return toISO(d);})();
+  const kRows = marRows.filter(r=>r.date>=from7);
+  const kRev = kRows.reduce((s,r)=>s+(r.revenue||0),0);
+  const kGP  = kRows.reduce((s,r)=>s+(r.gross_profit||0),0);
+  const kChecks = (revRows.filter(r=>r.date>=from7)).reduce((s,r)=>s+(r.receipts||0),0);
+  const kMargin = kRev ? (kGP/kRev*100) : 0;
+  const kAT = kChecks ? (kRev/kChecks) : 0;
+  const set=(id,txt)=>{ const el=document.getElementById(id); if(el) el.textContent=txt; };
+  set('kpi-rev', fmt(kRev)+' ₽'); set('kpi-gp', fmt(kGP)+' ₽'); set('kpi-margin', kMargin.toFixed(1)+' %'); set('kpi-at', fmt(kAT)+' ₽');
+
+  if(window.Plotly){
+    const byWh = by(revRows,'warehouse'); const dates=[...new Set(revRows.map(r=>r.date))].sort();
+    Plotly.newPlot('chart-revenue',
+      Object.entries(byWh).map(([wh, arr])=>{
+        const map=Object.fromEntries(arr.map(r=>[r.date,r.revenue]));
+        return {x:dates,y:dates.map(d=>map[d]??0),type:'scatter',mode:'lines+markers',name:wh};
+      }),
+      {paper_bgcolor:'#0b0c10',plot_bgcolor:'#0b0c10',xaxis:{gridcolor:'#222831',tickformat:'%Y-%m-%d'},yaxis:{gridcolor:'#222831',title:'₽'},margin:{t:10,r:10,b:40,l:60}},
+      {displayModeBar:false,responsive:true}
+    );
+
+    const byWhM = by(marRows,'warehouse'); const datesM=[...new Set(marRows.map(r=>r.date))].sort();
+    const tracesM=[];
+    for(const [wh, arr] of Object.entries(byWhM)){
+      const gp=Object.fromEntries(arr.map(r=>[r.date,r.gross_profit]));
+      const mp=Object.fromEntries(arr.map(r=>[r.date,r.margin_pct]));
+      tracesM.push({x:datesM,y:datesM.map(d=>gp[d]??0),type:'bar',name:wh+' GP',opacity:0.75});
+      tracesM.push({x:datesM,y:datesM.map(d=>mp[d]??0),type:'scatter',mode:'lines',name:wh+' %',yaxis:'y2'});
+    }
+    Plotly.newPlot('chart-margin', tracesM, {
+      paper_bgcolor:'#0b0c10',plot_bgcolor:'#0b0c10',xaxis:{gridcolor:'#222831',tickformat:'%Y-%m-%d'},
+      yaxis:{gridcolor:'#222831',title:'Валовая прибыль ₽'},
+      yaxis2:{gridcolor:'#222831',title:'Маржа %',overlaying:'y',side:'right'},
+      barmode:'group',margin:{t:10,r:60,b:40,l:60}
+    }, {displayModeBar:false,responsive:true});
+
+    const byWhI = by(infRows,'warehouse'); const datesI=[...new Set(infRows.map(r=>r.date))].sort();
+    Plotly.newPlot('chart-inflow',
+      Object.entries(byWhI).map(([wh, arr])=>{
+        const map=Object.fromEntries(arr.map(r=>[r.date,r.inflow]));
+        return {x:datesI,y:datesI.map(d=>map[d]??0),type:'bar',name:wh};
+      }),
+      {paper_bgcolor:'#0b0c10',plot_bgcolor:'#0b0c10',xaxis:{gridcolor:'#222831',tickformat:'%Y-%m-%d'},yaxis:{gridcolor:'#222831',title:'Оприходования ₽'},barmode:'group',margin:{t:10,r:10,b:40,l:60}},
+      {displayModeBar:false,responsive:true}
+    );
+  }
+}
+
+async function fetchSummarySeries(start,end,wh,group){
+  const url=new URL('/api/summary',location.origin);
+  url.searchParams.set('start',start);
+  url.searchParams.set('end',end);
+  url.searchParams.set('group',group||'day');
+  if(wh) url.searchParams.set('warehouse_id',wh);
+  const data=await jget(url.toString());
+  const series=data.series||[];
+  // отдаём период-метку и сумму
+  return series.map(r=>({period:r.period, revenue:r.revenue||0}));
+}
+function prevPeriodRange(startISO,endISO){
+  const len=rangeDays(startISO,endISO).length;
+  const s=parseISO(startISO);
+  const prevEnd=new Date(s); prevEnd.setDate(prevEnd.getDate()-1);
+  const prevStart=new Date(prevEnd); prevStart.setDate(prevStart.getDate()-(len-1));
+  return {start:toISO(prevStart),end:toISO(prevEnd)};
+}
+function prevYearRange(startISO,endISO){
+  const s=parseISO(startISO), e=parseISO(endISO);
+  const s2=new Date(s.getFullYear()-1,s.getMonth(),s.getDate());
+  const e2=new Date(e.getFullYear()-1,e.getMonth(),e.getDate());
+  s2.setHours(0,0,0,0); e2.setHours(0,0,0,0);
+  return {start:toISO(s2),end:toISO(e2)};
+}
+
+function findWarehouseNameById(id){
+  const w=(window.__WAREHOUSES__||[]).find(x=>String(x.id)===String(id));
+  return w?.name;
+}
+function ensureWriteoffContainers(){
+  const grid=document.querySelector('.grid'); if(!grid) return;
+  if(!document.getElementById('chart-writeoff')){
+    const card=document.createElement('div');
+    card.className='card col-12';
+    card.innerHTML='<div class="muted">Списания по дням (дефект/инвентаризация/прочее) — стэк + линия Total</div><div id="chart-writeoff" style="height:380px"></div>';
+    grid.appendChild(card);
+  }
+  if(!document.getElementById('writeoff-reasons')){
+    const card=document.createElement('div');
+    card.className='card col-12';
+    card.innerHTML='<div class="muted">Списания по причинам (сумма и % от выручки за период)</div><div id="writeoff-reasons"></div>';
+    grid.appendChild(card);
+  }
+}
+
+async function loadWriteoffBlock(){
+  ensureWriteoffContainers();
+  const start=document.getElementById('start')?.value;
+  const end=document.getElementById('end')?.value;
+  const whId=document.getElementById('warehouse')?.value || '';
+  const whName=whId?findWarehouseNameById(whId):null;
+
+  const dailyURL=new URL('/api/writeoff/daily',location.origin);
+  dailyURL.searchParams.set('start',start); dailyURL.searchParams.set('end',end);
+  const daily=(await jget(dailyURL.toString())).data||[];
+  const dailyFiltered = whName ? daily.filter(r=>r.warehouse===whName) : daily;
+
+  const days=[...new Set(dailyFiltered.map(r=>r.date))].sort();
+  const mapByDate=Object.fromEntries(days.map(d=>[d,{defect:0,inventory:0,other:0,total:0}]));
+  for(const r of dailyFiltered){
+    const m=mapByDate[r.date];
+    m.defect+=r.defect||0; m.inventory+=r.inventory||0; m.other+=r.other||0; m.total+=r.total||0;
+  }
+  if(window.Plotly){
+    const x=days, yDef=x.map(d=>mapByDate[d].defect), yInv=x.map(d=>mapByDate[d].inventory), yOth=x.map(d=>mapByDate[d].other), yTot=x.map(d=>mapByDate[d].total);
+    Plotly.newPlot('chart-writeoff',[
+      {x,y:yDef,type:'bar',name:'Дефект'},
+      {x,y:yInv,type:'bar',name:'Инвентаризация'},
+      {x,y:yOth,type:'bar',name:'Прочее'},
+      {x,y:yTot,type:'scatter',mode:'lines+markers',name:'Всего',yaxis:'y2'}
+    ],{
+      paper_bgcolor:'#0b0c10',plot_bgcolor:'#0b0c10',
+      xaxis:{gridcolor:'#222831',tickformat:'%Y-%m-%d'},
+      yaxis:{gridcolor:'#222831',title:'Списания ₽',rangemode:'tozero'},
+      yaxis2:{gridcolor:'#222831',title:'Всего ₽',overlaying:'y',side:'right'},
+      barmode:'stack',margin:{t:10,r:60,b:40,l:60}
+    },{displayModeBar:false,responsive:true});
+  }
+
+  const reasonURL=new URL('/api/writeoff/reasons',location.origin);
+  reasonURL.searchParams.set('start',start); reasonURL.searchParams.set('end',end);
+  const reasonRows=(await jget(reasonURL.toString())).data||[];
+  const reasonFiltered=whName?reasonRows.filter(r=>r.warehouse===whName):reasonRows;
+  const totalInPeriod=reasonFiltered.reduce((s,r)=>s+(r.cost||0),0);
+
+  let revenueTotal=0;
+  try{
+    const sum=await jget(`/api/summary?start=${start}&end=${end}&group=day${whId?`&warehouse_id=${whId}`:''}`);
+    revenueTotal=sum.totals?.revenue||0;
+  }catch(_) {}
+
+  const aggr={};
+  for(const r of reasonFiltered){ const k=r.reason||'(без причины)'; aggr[k]=(aggr[k]||0)+(r.cost||0); }
+  const rows=Object.entries(aggr).sort((a,b)=>b[1]-a[1]).map(([reason,cost])=>{
+    const pctW = totalInPeriod? (cost/totalInPeriod*100):0;
+    const pctR = revenueTotal? (cost/revenueTotal*100):0;
+    return {reason, cost, pctW, pctR};
+  });
+
+  let html='<table><thead><tr><th>Причина</th><th>Сумма ₽</th><th>% в списаниях</th><th>% от выручки</th></tr></thead><tbody>';
+  for(const r of rows){ html+=`<tr><td>${r.reason}</td><td>${fmt(r.cost)}</td><td>${r.pctW.toFixed(1)} %</td><td>${r.pctR.toFixed(2)} %</td></tr>`; }
+  if(rows.length===0) html+='<tr><td colspan="4" class="muted">Нет данных</td></tr>';
+  html+='</tbody></table>';
+  const box=document.getElementById('writeoff-reasons'); if(box) box.innerHTML=html;
+}
+
+async function loadTopWarehouses(start,end){
+  try{
+    const res=await jget(`/api/top/warehouses?start=${start}&end=${end}`);
+    const rows=res.data||[];
+    const el=document.getElementById('top-warehouses'); if(!el) return;
+    let html='<table><thead><tr><th>Склад</th><th>Выручка</th><th>GP</th><th>Маржа</th><th>Чеки</th><th>Ср. чек</th></tr></thead><tbody>';
+    for(const r of rows){ html+=`<tr><td>${r.warehouse}</td><td>${fmt(r.revenue)} ₽</td><td>${fmt(r.gross_profit)} ₽</td><td>${(r.margin_pct||0).toFixed(1)} %</td><td>${(r.checks||0).toFixed(0)}</td><td>${fmt(r.avg_ticket||0)} ₽</td></tr>`; }
+    html+='</tbody></table>'; el.innerHTML=html;
+  }catch(e){ console.warn('top warehouses failed', e); }
+}
+async function loadTopProducts(start,end,wh){
+  try{
+    const url=new URL('/api/top/products',location.origin);
+    url.searchParams.set('start',start); url.searchParams.set('end',end); if(wh) url.searchParams.set('warehouse_id',wh);
+    const res=await jget(url.toString()); const rows=res.data||[];
+    const el=document.getElementById('top-products'); if(!el) return;
+    let html='<table><thead><tr><th>Товар</th><th>Выручка</th><th>GP</th><th>Маржа</th><th>Кол-во</th><th>Ср. цена</th></tr></thead><tbody>';
+    for(const r of rows){ html+=`<tr><td>${r.name}</td><td>${fmt(r.revenue)} ₽</td><td>${fmt(r.gross_profit)} ₽</td><td>${(r.margin_pct||0).toFixed(1)} %</td><td>${(r.qty||0).toFixed(0)}</td><td>${fmt(r.avg_price||0)} ₽</td></tr>`; }
+    html+='</tbody></table>'; el.innerHTML=html;
+    const scope=document.getElementById('tp-scope'); if(scope) scope.textContent=wh?('склад ID '+wh):'по всем складам';
+  }catch(e){ console.warn('top products failed', e); }
+}
+
+async function loadCompareChart(){
+  const start=document.getElementById('start')?.value;
+  const end=document.getElementById('end')?.value;
+  const wh=document.getElementById('warehouse')?.value;
+  const group=document.getElementById('group')?.value || 'day';
+
+  // Текущая серия агрегирована по group (day/month/year)
+  const nowSeries=await fetchSummarySeries(start,end,wh,group); // [{period:"YYYY-MM-DD"|"YYYY-MM-01"|..., revenue}]
+  const xNow=nowSeries.map(r=>r.period); const yNow=nowSeries.map(r=>r.revenue);
+
+  const traces=[{x:xNow,y:yNow,type:'scatter',mode:'lines+markers',name:'Текущий период'}];
+
+  const doPrev=document.getElementById('cmp-prev-period')?.checked;
+  const doYoY=document.getElementById('cmp-prev-year')?.checked;
+
+  if(doPrev){
+    const pp=prevPeriodRange(start,end);
+    const prevSeries=await fetchSummarySeries(pp.start,pp.end,wh,group);
+    const yPrev=prevSeries.map(r=>r.revenue);
+    traces.push({x:xNow,y:yPrev,type:'scatter',mode:'lines',name:'Пред. период',line:{dash:'dot'}});
+  }
+  if(doYoY){
+    const yy=prevYearRange(start,end);
+    const yoySeries=await fetchSummarySeries(yy.start,yy.end,wh,group);
+    const yYoy=yoySeries.map(r=>r.revenue);
+    traces.push({x:xNow,y:yYoy,type:'scatter',mode:'lines',name:'Год назад',line:{dash:'dash'}});
+  }
+
+  if(window.Plotly){
+    const yTitle = 'Выручка ₽' + (group==='day'?' (по дням)': group==='month'?' (по месяцам)':' (итоги по годам)');
+    Plotly.newPlot('chart-compare', traces, {
+      paper_bgcolor:'#0b0c10', plot_bgcolor:'#0b0c10',
+      xaxis:{gridcolor:'#222831', title:(group==='day'?'Дни':'Периоды')},
+      yaxis:{gridcolor:'#222831', title:yTitle},
+      margin:{t:10,r:10,b:40,l:60}, legend:{orientation:'h'}
+    }, {displayModeBar:false, responsive:true});
+  }
+}
+
+async function loadComparison(){
+  const start=document.getElementById('start')?.value;
+  const end=document.getElementById('end')?.value;
+  const group=document.getElementById('group')?.value || 'day';
+  const wh=document.getElementById('warehouse')?.value;
+
+  const url=new URL('/api/summary',location.origin);
+  url.searchParams.set('start',start); url.searchParams.set('end',end); url.searchParams.set('group',group); if(wh) url.searchParams.set('warehouse_id',wh);
+  const data=await jget(url.toString());
+  const t=data.totals||{}; const c=data.compare||{}; const prev=c.previous||{}, yoy=c.previous_year||{};
+  const pack=(r)=>({ rev:r.revenue||0, gp:(r.revenue||0)-(r.cost||0), mar:(r.revenue?(((r.revenue-(r.cost||0))/r.revenue*100)):0), at:(r.receipts?(r.revenue/r.receipts):0), chk:(r.receipts||0), inflow:r.inflow_cost||0 });
+  const cur=pack(t), p=pack(prev), y=pack(yoy);
+
+  // динамические подписи годов
+  const endY = parseISO(end).getFullYear();
+  const prevEndY = parseISO(start).getFullYear(); // «предыдущий» — ориентируемся на год начала предыдущего периода
+  const yoyY = endY-1;
+
+  document.getElementById('compare').textContent=`Период ${start} – ${end}${wh? ' • Склад ID '+wh : ''} • Группировка: ${group}`;
+
+  const rows=[
+    ['Выручка',cur.rev,p.rev,pctDelta(cur.rev,p.rev),y.rev,pctDelta(cur.rev,y.rev)],
+    ['Валовая прибыль',cur.gp,p.gp,pctDelta(cur.gp,p.gp),y.gp,pctDelta(cur.gp,y.gp)],
+    ['Маржа %',cur.mar,p.mar,cur.mar-p.mar,y.mar,cur.mar-y.mar],
+    ['Средний чек',cur.at,p.at,pctDelta(cur.at,p.at),y.at,pctDelta(cur.at,y.at)],
+    ['Количество чеков',cur.chk,p.chk,pctDelta(cur.chk,p.chk),y.chk,pctDelta(cur.chk,y.chk)],
+    // списания и оприходования появятся ниже отдельным блоком
+  ];
+
+  let html=`<table><thead><tr>
+  <th>Метрика</th>
+  <th>Текущий (${endY})</th>
+  <th>Предыдущий (${prevEndY})</th>
+  <th>Δ к пред.</th>
+  <th>Год назад (${yoyY})</th>
+  <th>Δ к прошл. году</th>
+  </tr></thead><tbody>`;
+
+  for(const r of rows){
+    const [name,curv,pv,d1,yv,d2]=r;
+    const curFmt = name==='Маржа %'? (curv||0).toFixed(1)+' %' : (name==='Количество чеков'? (curv||0).toFixed(0) : fmt(curv||0)+' ₽');
+    const pFmt   = name==='Маржа %'? (pv||0).toFixed(1)+' %' : (name==='Количество чеков'? (pv||0).toFixed(0) : fmt(pv||0)+' ₽');
+    const yFmt   = name==='Маржа %'? (yv||0).toFixed(1)+' %' : (name==='Количество чеков'? (yv||0).toFixed(0) : fmt(yv||0)+' ₽');
+    const d1Fmt  = name==='Маржа %'? (isFinite(d1)? d1.toFixed(1)+' п.п.':'—') : (isFinite(d1)? d1.toFixed(1)+' %':'—');
+    const d2Fmt  = name==='Маржа %'? (isFinite(d2)? d2.toFixed(1)+' п.п.':'—') : (isFinite(d2)? d2.toFixed(1)+' %':'—');
+    html+=`<tr><td>${name}</td><td>${curFmt}</td><td>${pFmt}</td><td class="${cls(d1)}">${d1Fmt}</td><td>${yFmt}</td><td class="${cls(d2)}">${d2Fmt}</td></tr>`;
+  }
+  html+='</tbody></table>';
+  document.getElementById('compare-table').innerHTML=html;
+
+  // ТОПы
+  await Promise.all([loadTopWarehouses(start,end), loadTopProducts(start,end,wh)]);
+  // Сравнительный график с учётом группировки
+  await loadCompareChart();
+  // Блок списаний
+  await loadWriteoffBlock();
+}
+
+function addChartToggles(){
+  try{
+    const grid=document.querySelector('.grid'); if(!grid) return;
+    if(document.getElementById('chart-toggles')) return;
+    const card=document.createElement('div');
+    card.className='card col-12';
+    card.id='chart-toggles';
+    card.innerHTML = `
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <span class="muted">Показать графики:</span>
+        <label><input type="checkbox" data-target="#chart-revenue" checked> Выручка</label>
+        <label><input type="checkbox" data-target="#chart-margin" checked> Маржа/GP</label>
+        <label><input type="checkbox" data-target="#chart-inflow" checked> Оприходования</label>
+        <label><input type="checkbox" data-target="#chart-writeoff" checked> Списания</label>
+      </div>`;
+    grid.insertBefore(card, grid.firstChild);
+    card.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+      cb.addEventListener('change',(e)=>{
+        const sel=e.target.getAttribute('data-target');
+        const el=document.querySelector(sel)?.closest('.card') || document.querySelector(sel);
+        if(el) el.style.display=e.target.checked?'':'none';
+      });
+    });
+  }catch(e){ console.debug('toggles failed', e); }
+}
+
+function wireQuickButtons(){
+  const qs=(id)=>document.getElementById(id);
+  qs('btn-cur-month')?.addEventListener('click', ()=>{ setPeriodCurrentMonth(); loadComparison(); });
+  qs('btn-prev-month')?.addEventListener('click', ()=>{ setPeriodPrevMonth(); loadComparison(); });
+  qs('btn-ytd')?.addEventListener('click', ()=>{ setPeriodYTD(); loadComparison(); });
+  qs('btn-prev-year')?.addEventListener('click', ()=>{ setPeriodPrevYear(); loadComparison(); });
+  qs('cmp-prev-period')?.addEventListener('change', loadCompareChart);
+  qs('cmp-prev-year')?.addEventListener('change', loadCompareChart);
+  qs('group')?.addEventListener('change', loadCompareChart); // группировка влияет на сравнит. график
+  qs('apply')?.addEventListener('click', loadComparison);
+}
+
+async function boot(){
+  try{
+    setPeriodCurrentMonth();
+    await loadWarehouses();
+    await loadChartsAndKPI();
+    wireQuickButtons();
+    addChartToggles();
+    await loadComparison();
+  }catch(e){ console.error('dashboard boot failed', e); }
+}
+document.addEventListener('DOMContentLoaded', boot);
