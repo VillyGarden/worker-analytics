@@ -1,12 +1,34 @@
-.env
-*.pyc
+# venv / python cache
+.venv/
+venv/
 __pycache__/
-logs/
-tmp/
-*.log
-*.tsv
-*.json
-.DS_Store
+*.pyc
+*.pyo
+
+# env / секреты
 .env
 .env.*
 *.env
+
+# логи / временные
+logs/
+*.log
+tmp/
+*.tmp
+*.cache
+*.swp
+
+# бэкапы/временные файлы
+*.bak
+*~ 
+*.orig
+app/*.bak.*
+app/**/*.bak.*
+
+# OS/IDE junk
+.DS_Store
+.idea/
+.vscode/
+
+# локальные дампы/выгрузки
+/tmp/
