@@ -32,3 +32,6 @@ app/**/*.bak.*
 
 # локальные дампы/выгрузки
 /tmp/
+
+# Ignore backup files
+*.bak.*
