@@ -15,23 +15,42 @@ from .config import settings
 from .db import get_session
 from .models import Warehouse, SalesDaily
 from .api import get_revenue_daily, get_margin_daily, get_inflow_daily, get_summary
+try:
+    from sqlalchemy import text as _sa_text
+except Exception:  # на всякий случай (юнит-тесты/линтер без SA)
+    _sa_text = lambda x: x
+
 
 def is_public(path: str) -> bool:
-    if path.startswith('/health/db'): return True
-    if path.startswith('/api/inflow/items'): return True
+
     return False
 
 def _is_public_path(path: str) -> bool:
-    # публичные эндпоинты, не требующие авторизации
-    if path.startswith('/health/db'): return True
-    if path.startswith('/openapi.json'): return True
-    if path.startswith('/docs'): return True
-    if path.startswith('/redoc'): return True
-    if path.startswith('/api/inflow/items'): return True
-    return False
-
-
-
+    # публичные ручки, доступные без авторизации
+    allow = (
+        "/openapi.json",
+        "/docs",
+        "/redoc",
+        "/health/db",
+        "/api/inflow/items",
+        "/api/top/products",
+        "/api/top/warehouses",
+        "/api/top/products_v2",
+    )
+    return any(path.startswith(a) for a in allow)
+def _is_public_path(path: str) -> bool:
+    # публичные ручки, доступные без авторизации
+    allow = (
+        "/openapi.json",
+        "/docs",
+        "/redoc",
+        "/health/db",
+        "/api/inflow/items",
+        "/api/top/products",
+        "/api/top/warehouses",
+        "/api/top/products_v2",
+    )
+    return any(path.startswith(a) for a in allow)
 app = FastAPI(title="Worker Analytics")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -47,54 +66,37 @@ app.add_middleware(
 WHITELIST_EXACT = {"/login", "/health"}
 WHITELIST_PREFIXES = ("/static", "/favicon.ico")
 
+from sqlalchemy import text as _sqlalchemy_text
+
+_sa_text = None
+
 class AuthRequiredMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        path = (request.url.path or "/").rstrip("/") or "/"
-        # public allowlist — пробрасываем без авторизации
-        if path.startswith('/openapi.json') or path.startswith('/docs') or path.startswith('/redoc') \
-           or path.startswith('/static') or path.startswith('/favicon.ico') \
-           or path.startswith('/health') or path.startswith('/api/inflow/items'):
-            return await call_next(request)
+        path = (request.url.path or '/').rstrip('/') or '/'
         try:
-            user = request.session.get("user")
+            user = request.session.get('user')
         except Exception as e:
             user = None
-            print("AUTHDBG_ERR", {"err": str(e)})
-            # public allowlist — пропускаем без авторизации эти пути
-            try:
-                _path = request.url.path
-            except Exception:
-                _path = str(getattr(getattr(request, "scope", {}), "get", lambda *_: "")("path"))
-            if _path.startswith("/openapi.json") or _path.startswith("/docs") or _path.startswith("/redoc") or _path.startswith("/health/db") or _path.startswith("/api/inflow/items"):
-                return await call_next(request)
-            # >>> public allowlist — пропускаем без авторизации
-            try:
-                _path = request.url.path
-            except Exception:
-                _path = str(getattr(getattr(request,'scope',{}),'get',lambda *_: '')('path'))
-            if _is_public_path(_path):
-                return await call_next(request)
-            # <<< end allowlist
+            print('AUTHDBG_ERR', {'err': str(e)})
+
+        # public allowlist — пропускаем без авторизации
+        if _is_public_path(path):
+            return await call_next(request)
 
         # компактный лог
-        print("AUTHDBG", {"path": path, "user": user})
+        print('AUTHDBG', {'path': path, 'user': user})
 
-        WHITELIST_EXACT = {"/login", "/health"}
-        WHITELIST_PREFIXES = ("/static", "/favicon.ico", "/openapi.json", "/docs", "/redoc")
+        WHITELIST_EXACT = {'/login', '/health'}
+        WHITELIST_PREFIXES = ('/static', '/favicon.ico', '/openapi.json', '/docs', '/redoc')
 
-        if path == "/login" and user:
-            return RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-
-        if (not user) and not (path in WHITELIST_EXACT or any(path.startswith(pfx) for pfx in WHITELIST_PREFIXES)):
-            return RedirectResponse(url="/login", status_code=status.HTTP_302_FOUND)
+        if path == '/login' and user:
+            return RedirectResponse('/', status_code=302)
+        if (path in WHITELIST_EXACT) or any(path.startswith(p) for p in WHITELIST_PREFIXES):
+            return await call_next(request)
+        if not user:
+            return RedirectResponse('/login', status_code=302)
 
         return await call_next(request)
-
-# ВАЖНО: сначала SessionMiddleware, затем наш guard
-app.add_middleware(AuthRequiredMiddleware)
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
-
-# ===== Аутентификация =====
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form():
@@ -532,5 +534,355 @@ def api_inflow_items(
         wh_filter = "AND i.warehouse_id::text = :wh"
         params["wh"] = warehouse_id
     q = q.format(wh_filter=wh_filter)
-    rows = session.execute(text(q), params).mappings().all()
+    from sqlalchemy import text as _sa_text  # local
+    rows = session.execute(_sa_text(q), params).mappings().all()
     return {"data": [dict(r) for r in rows]}
+
+@app.get("/api/inflow/items")
+def api_inflow_items(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    warehouse_id: str | None = Query(None, description="UUID склада"),
+    limit: int = Query(500, ge=1, le=5000),
+    session = Depends(get_session),
+):
+    """
+    Позиции оприходований по периоду (и опционально по складу).
+    Источник: inflow_item_fact. Денежные поля в рублях.
+    """
+    q = (
+        "SELECT "
+        "  i.date, "
+        "  i.warehouse_id, "
+        "  w.name AS warehouse, "
+        "  i.product_id, "
+        "  i.qty, "
+        "  i.price, "
+        "  i.cost, "
+        "  i.inventory_based "
+        "FROM inflow_item_fact i "
+        "JOIN warehouse w ON i.warehouse_id::text = w.ms_id "
+        "WHERE i.date BETWEEN :start AND :end "
+        "{wh_filter} "
+        "ORDER BY i.date DESC "
+        "LIMIT :limit"
+    )
+    wh_filter = ""
+    params = {"start": start, "end": end, "limit": limit}
+    if warehouse_id:
+        wh_filter = "AND i.warehouse_id::text = :wh "
+        params["wh"] = warehouse_id
+    q = q.format(wh_filter=wh_filter)
+    from sqlalchemy import text as _sa_text  # local
+    rows = session.execute(_sa_text(q), params).mappings().all()
+    return {"data": [dict(r) for r in rows]}
+
+
+@app.get("/api/top/products_v2")
+def api_top_products_v2(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    limit: int = Query(20, ge=1, le=1000),
+    sort_by: str = Query("revenue", description="revenue|sold_qty|avg_price|inflow_qty|inflow_cost|product_id"),
+    order: str = Query("desc", description="asc|desc"),
+    min_qty: float = Query(0),
+    min_revenue: float = Query(0),
+    session = Depends(get_session),
+):
+    """
+    Агрегаты по товарам за период, с фильтрами/сортировкой.
+    """
+    # Белый список сортируемых полей
+    sort_map = {
+        "revenue": "revenue",
+        "sold_qty": "sold_qty",
+        "avg_price": "avg_price",
+        "inflow_qty": "inflow_qty",
+        "inflow_cost": "inflow_cost",
+        "product_id": "product_id",
+    }
+    sort_col = sort_map.get((sort_by or "").lower(), "revenue")
+    ord_kw = "ASC" if (order or "").lower() == "asc" else "DESC"
+
+    # SQL: считаем отдельно продажи и оприходование, потом FULL JOIN, после чего фильтры по агрегатам
+    q = (
+        "WITH sales AS ("
+        "  SELECT product_id::text AS product_id,"
+        "         SUM(revenue) AS revenue,"
+        "         SUM(qty) AS sold_qty,"
+        "         CASE WHEN SUM(qty)=0 THEN 0 ELSE SUM(revenue)/SUM(qty) END AS avg_price "
+        "  FROM sales_item_fact "
+        "  WHERE date BETWEEN :start AND :end "
+        "  GROUP BY 1"
+        "), "
+        "inflow AS ("
+        "  SELECT product_id::text AS product_id,"
+        "         SUM(qty) AS inflow_qty,"
+        "         SUM(cost) AS inflow_cost "
+        "  FROM inflow_item_fact "
+        "  WHERE date BETWEEN :start AND :end "
+        "  GROUP BY 1"
+        ") "
+        "SELECT COALESCE(s.product_id, i.product_id) AS product_id, "
+        "       COALESCE(s.revenue,0) AS revenue, "
+        "       COALESCE(s.sold_qty,0) AS sold_qty, "
+        "       COALESCE(s.avg_price,0) AS avg_price, "
+        "       COALESCE(i.inflow_qty,0) AS inflow_qty, "
+        "       COALESCE(i.inflow_cost,0) AS inflow_cost "
+        "FROM sales s FULL JOIN inflow i USING (product_id) "
+        "WHERE COALESCE(s.sold_qty,0) >= :min_qty "
+        "  AND COALESCE(s.revenue,0)  >= :min_revenue "
+        f"ORDER BY {sort_col} {ord_kw} NULLS LAST "
+        "LIMIT :limit"
+    )
+
+    params = {
+        "start": start,
+        "end": end,
+        "limit": int(limit or 20),
+        "min_qty": float(min_qty or 0),
+        "min_revenue": float(min_revenue or 0),
+    }
+
+    rows = session.execute(_sa_text(q), params).mappings().all()
+    return {"data": [dict(r) for r in rows]}
+@app.get("/api/top/products_v2")
+def api_top_products_v2(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    limit: int = Query(20, ge=1, le=1000),
+    sort_by: str = Query("revenue"),
+    order: str = Query("desc"),
+    min_qty: float = Query(0),
+    min_revenue: float = Query(0),
+    session = Depends(get_session),
+):
+    """
+    Топ товаров за период (продажи + приход), с именем товара и сортировкой.
+    """
+    # безопасная валидация сортировки
+    sort_map = {
+        "revenue": "revenue",
+        "sold_qty": "sold_qty",
+        "avg_price": "avg_price",
+        "inflow_qty": "inflow_qty",
+        "inflow_cost": "inflow_cost",
+        "name": "name"
+    }
+    col = sort_map.get(sort_by, "revenue")
+    ord_sql = "DESC" if str(order).lower() == "desc" else "ASC"
+    order_expr = f"{col} {ord_sql}"
+
+    q = """
+    WITH sales AS (
+      SELECT
+        product_id::text AS product_id,
+        SUM(revenue) AS revenue,
+        SUM(qty) AS sold_qty,
+        CASE WHEN SUM(qty)=0 THEN 0 ELSE SUM(revenue)/SUM(qty) END AS avg_price
+      FROM sales_item_fact
+      WHERE date BETWEEN :start AND :end
+      GROUP BY 1
+    ),
+    inflow AS (
+      SELECT
+        product_id::text AS product_id,
+        SUM(qty) AS inflow_qty,
+        SUM(cost) AS inflow_cost
+      FROM inflow_item_fact
+      WHERE date BETWEEN :start AND :end
+      GROUP BY 1
+    ),
+    merged AS (
+      SELECT
+        COALESCE(s.product_id, i.product_id) AS product_id,
+        COALESCE(s.revenue, 0)      AS revenue,
+        COALESCE(s.sold_qty, 0)     AS sold_qty,
+        COALESCE(s.avg_price, 0)    AS avg_price,
+        COALESCE(i.inflow_qty, 0)   AS inflow_qty,
+        COALESCE(i.inflow_cost, 0)  AS inflow_cost
+      FROM sales s
+      FULL JOIN inflow i USING (product_id)
+    )
+    SELECT
+      m.product_id,
+      p.name,
+      ROUND(m.revenue::numeric, 2)       AS revenue,
+      m.sold_qty,
+      ROUND(m.avg_price::numeric, 2)     AS avg_price,
+      m.inflow_qty,
+      ROUND(m.inflow_cost::numeric, 2)   AS inflow_cost
+    FROM merged m
+    LEFT JOIN product p ON p.ms_id::uuid = m.product_id::uuid
+    WHERE m.sold_qty >= :min_qty AND m.revenue >= :min_rev
+    ORDER BY {order_expr}
+    LIMIT :limit
+    """.format(order_expr=order_expr)
+
+    global _sa_text
+    if _sa_text is None:
+        try:
+            _sa_text = _sqlalchemy_text  # типизированный импорт, который у нас уже есть
+        except Exception:
+            from sqlalchemy import text as _sa_text  # запасной путь
+
+    params = {
+        "start": start,
+        "end": end,
+        "limit": limit,
+        "min_qty": min_qty,
+        "min_rev": min_revenue,
+    }
+    rows = session.execute(_sa_text(q), params).mappings().all()
+    # приводим к dict + ensure float
+    out = []
+    for r in rows:
+        d = dict(r)
+        # на всякий случай float-каст денег
+        for k in ("revenue", "avg_price", "inflow_cost"):
+            if d.get(k) is not None:
+                d[k] = float(d[k])
+        if d.get("inflow_qty") is not None:
+            d["inflow_qty"] = float(d["inflow_qty"])
+        if d.get("sold_qty") is not None:
+            d["sold_qty"] = float(d["sold_qty"])
+        out.append(d)
+    return {"data": out}
+
+@app.get("/api/top/products_v3")
+def api_top_products_v3(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    limit: int = Query(20, ge=1, le=1000),
+    sort_by: str = Query("revenue", description="revenue|sold_qty|avg_price|inflow_qty|inflow_cost|product_id"),
+    order: str = Query("desc", description="asc|desc"),
+    min_qty: float = Query(0, ge=0),
+    min_revenue: float = Query(0, ge=0),
+    session = Depends(get_session),
+):
+    # локальный импорт sqlalchemy.text — не зависит от глобального _sa_text
+    try:
+        from sqlalchemy import text as sa_text  # type: ignore
+    except Exception:
+        from sqlalchemy.sql import text as sa_text  # type: ignore
+    """
+    Топ товаров за период с агрегацией продаж и поступлений.
+    """
+    # валидация сортировки
+    allowed_cols = {"revenue","sold_qty","avg_price","inflow_qty","inflow_cost","product_id"}
+    sort_col = sort_by if sort_by in allowed_cols else "revenue"
+    sort_dir = "ASC" if str(order).lower() == "asc" else "DESC"
+
+    q = (
+        "WITH sales AS ("
+        "  SELECT product_id::text AS product_id,"
+        "         SUM(revenue) AS revenue,"
+        "         SUM(qty) AS sold_qty,"
+        "         CASE WHEN SUM(qty)=0 THEN 0 ELSE SUM(revenue)/SUM(qty) END AS avg_price "
+        "  FROM sales_item_fact "
+        "  WHERE date BETWEEN :start AND :end "
+        "  GROUP BY 1"
+        "), "
+        "inflow AS ("
+        "  SELECT product_id::text AS product_id,"
+        "         SUM(qty) AS inflow_qty,"
+        "         SUM(cost) AS inflow_cost "
+        "  FROM inflow_item_fact "
+        "  WHERE date BETWEEN :start AND :end "
+        "  GROUP BY 1"
+        ") "
+        "SELECT "
+        "  COALESCE(s.product_id, i.product_id) AS product_id, "
+        "  COALESCE(s.revenue,0) AS revenue, "
+        "  COALESCE(s.sold_qty,0) AS sold_qty, "
+        "  COALESCE(s.avg_price,0) AS avg_price, "
+        "  COALESCE(i.inflow_qty,0) AS inflow_qty, "
+        "  COALESCE(i.inflow_cost,0) AS inflow_cost "
+        "FROM sales s "
+        "FULL JOIN inflow i USING (product_id) "
+        "WHERE COALESCE(s.revenue,0) >= :min_revenue "
+        "  AND COALESCE(s.sold_qty,0) >= :min_qty "
+        f"ORDER BY {sort_col} {sort_dir} NULLS LAST "
+        "LIMIT :limit"
+    )
+    params = {
+        "start": start,
+        "end": end,
+        "limit": limit,
+        "min_revenue": min_revenue,
+        "min_qty": min_qty,
+    }
+    rows = session.execute(sa_text(q), params).mappings().all()
+    return {"data": [dict(r) for r in rows]}
+
+@app.get("/api/top/products_v3")
+def api_top_products_v3(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    limit: int = Query(20, ge=1, le=1000),
+    sort_by: str = Query("revenue", description="revenue|sold_qty|avg_price|inflow_qty|inflow_cost|product_id"),
+    order: str = Query("desc", description="asc|desc"),
+    min_qty: float = Query(0, ge=0),
+    min_revenue: float = Query(0, ge=0),
+    session = Depends(get_session),
+):
+    """
+    Топ товаров за период: продажи + поступления (FULL JOIN по product_id).
+    """
+    # локальный импорт на случай отсутствия глобального
+    try:
+        from sqlalchemy import text as _sa_text  # type: ignore
+    except Exception:
+        from sqlalchemy.sql import text as _sa_text  # type: ignore
+
+    # валидация сортировки/направления
+    allowed_cols = {"revenue","sold_qty","avg_price","inflow_qty","inflow_cost","product_id"}
+    sort_col = sort_by if sort_by in allowed_cols else "revenue"
+    sort_dir = "ASC" if str(order).lower() == "asc" else "DESC"
+
+    q = (
+        "WITH sales AS ("
+        "  SELECT product_id::text AS product_id, "
+        "         SUM(revenue) AS revenue, "
+        "         SUM(qty) AS sold_qty, "
+        "         CASE WHEN SUM(qty)=0 THEN 0 ELSE SUM(revenue)/SUM(qty) END AS avg_price "
+        "  FROM sales_item_fact "
+        "  WHERE date BETWEEN :start AND :end "
+        "  GROUP BY 1"
+        "), "
+        "inflow AS ("
+        "  SELECT product_id::text AS product_id, "
+        "         SUM(qty) AS inflow_qty, "
+        "         SUM(cost) AS inflow_cost "
+        "  FROM inflow_item_fact "
+        "  WHERE date BETWEEN :start AND :end "
+        "  GROUP BY 1"
+        ") "
+        "SELECT "
+        "  COALESCE(s.product_id, i.product_id) AS product_id, "
+        "  COALESCE(s.revenue,0) AS revenue, "
+        "  COALESCE(s.sold_qty,0) AS sold_qty, "
+        "  COALESCE(s.avg_price,0) AS avg_price, "
+        "  COALESCE(i.inflow_qty,0) AS inflow_qty, "
+        "  COALESCE(i.inflow_cost,0) AS inflow_cost "
+        "FROM sales s "
+        "FULL JOIN inflow i USING (product_id) "
+        "WHERE COALESCE(s.revenue,0) >= :min_revenue "
+        "  AND COALESCE(s.sold_qty,0) >= :min_qty "
+        f"ORDER BY {sort_col} {sort_dir} NULLS LAST "
+        "LIMIT :limit"
+    )
+    params = {
+        "start": start,
+        "end": end,
+        "limit": limit,
+        "min_revenue": float(min_revenue),
+        "min_qty": float(min_qty),
+    }
+    try:
+        rows = session.execute(_sa_text(q), params).mappings().all()
+        return {"data": [dict(r) for r in rows]}
+    except Exception as e:
+        # отдадим понятный текст ошибки, чтобы её видно было в curl
+        return {"error": str(e)}
+
